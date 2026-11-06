@@ -51,6 +51,7 @@
 // Defined further down; Arduino's generated prototypes miss these.
 void buildGammaLut();
 bool cardShowing();
+void closestApproach(const Aircraft& a, float& dNm, float& tSec);
 
 // Drawing a smooth-font glyph alloca()s its whole bitmap.
 SET_LOOP_TASK_STACK_SIZE(FONTS_MAX_GLYPH_BYTES + 12 * 1024);
@@ -95,7 +96,9 @@ const char*    PROVIDER_NAMES[] = {"airplanes.live", "adsb.lol"};
 #define REDRAW_MS        500        // radar frame interval (positions are extrapolated)
 #define SELECT_MS        30000      // a tapped aircraft stays selected this long
 #define ALERT_FORGET_MS  600000     // an aircraft can beep again after this long away
-#define CARD_EXIT_FACTOR 1.25f      // card closes once the aircraft is this far past the radius
+#define CARD_EXIT_FACTOR 1.25f      // card may close once the aircraft is this far past the radius
+#define CARD_LEAD_S      60         // open this long before the predicted closest approach
+#define CARD_MIN_MS      45000      // keep the card up at least this long (unless tapped / gone)
 #define RANGE_SAVE_MS    5000       // range buttons save to NVS after this long idle
 #define CLOCK_AFTER_MS   20000      // empty sky this long -> color clock
 #define PEEK_MS          30000      // a tap on the color clock shows the radar this long
@@ -2206,6 +2209,7 @@ void drawFrame(const struct tm* ti) {
 char        cardHex[7] = "";      // aircraft on the card; "" = no card
 char        dismissedHex[7] = "";
 int         cardMissing = 0;      // consecutive feeds without the card's aircraft
+uint32_t    cardOpenedAt = 0;     // millis() | 1
 CardInfo    card = {};            // loop's copy; card.jpg is not used here
 uint32_t    cardSeenVersion = 0;
 LGFX_Sprite photo;
@@ -2225,36 +2229,72 @@ void requestCard(const Aircraft& a) {
 
 void openCard(const Aircraft& a) {
   strlcpy(cardHex, a.hex, sizeof(cardHex));
+  cardOpenedAt = millis() | 1;
   cardMissing = 0;
   selHex[0] = 0;
   if (strcmp(card.hex, a.hex) != 0) { memset(&card, 0, sizeof(card)); photoOk = false; }
   requestCard(a);
-  Serial.printf("Card open: %s %.2f nm\n", aircraftName(a).c_str(), a.dist_nm);
+  float d, t;
+  closestApproach(a, d, t);
+  Serial.printf("Card open: %s %.2f nm, closest %.2f nm in %.0f s\n", aircraftName(a).c_str(), a.dist_nm, d, t);
 }
 
 void closeCard(const char* why) {
-  Serial.printf("Card closed (%s)\n", why);
+  Serial.printf("Card closed (%s) after %lu s\n", why, (unsigned long)(msSince(cardOpenedAt) / 1000));
   cardHex[0] = 0;
 }
 
-// Called with each new feed.
+// Where the aircraft passes closest to home if it holds its track and speed:
+// distance (nm) and seconds from now (negative = already past). Without a
+// track / speed it's just the current distance, now.
+void closestApproach(const Aircraft& a, float& dNm, float& tSec) {
+  double lat, lon;
+  extrapolate(a, millis(), lat, lon);
+  float px = (float)((lon - settings.home_lon) * 60.0 * cos(settings.home_lat * DEG));
+  float py = (float)((lat - settings.home_lat) * 60.0);
+  dNm = sqrtf(px * px + py * py);
+  tSec = 0;
+  if (a.gs <= 0 || a.track < 0 || a.alt == ALT_GROUND) return;
+  float vx = a.gs / 3600.0f * sinf(a.track * DEG), vy = a.gs / 3600.0f * cosf(a.track * DEG);
+  tSec = -(px * vx + py * vy) / (vx * vx + vy * vy);
+  if (tSec < 0) return;     // moving away: closest is now
+  float cx = px + vx * tSec, cy = py + vy * tSec;
+  dNm = sqrtf(cx * cx + cy * cy);
+}
+
+// Worth a card: airborne, and overhead now or about to be (within the radius
+// at its closest approach in the next CARD_LEAD_S).
+bool cardWorthy(const Aircraft& a, float radiusNm) {
+  if (a.alt == ALT_GROUND) return false;
+  if (a.dist_nm <= radiusNm) return true;
+  float d, t;
+  closestApproach(a, d, t);
+  return d <= radiusNm && t <= CARD_LEAD_S;
+}
+
+// Called with each new feed. Opens a card ahead of the closest approach and
+// keeps it up at least CARD_MIN_MS, so fast / high traffic is still readable.
 void updateCard() {
   float exitNm = overheadNm() * CARD_EXIT_FACTOR;
   if (dismissedHex[0]) {
     int i = findAircraft(dismissedHex);
-    if (i < 0 || viewAc[i].dist_nm > exitNm) dismissedHex[0] = 0;
+    if (i < 0 || !cardWorthy(viewAc[i], exitNm)) dismissedHex[0] = 0;
   }
   if (cardShowing()) {
     int i = findAircraft(cardHex);
+    bool minShown = msSince(cardOpenedAt) >= CARD_MIN_MS;
     if (!settings.show_card)                    closeCard("turned off");
     else if (i < 0)                             { if (++cardMissing >= 3) closeCard("gone"); }
-    else if (viewAc[i].alt == ALT_GROUND)       closeCard("landed");
-    else if (viewAc[i].dist_nm > exitNm)        closeCard("left");
-    else                                        cardMissing = 0;
+    else {
+      cardMissing = 0;
+      if (viewAc[i].alt == ALT_GROUND)                    { if (minShown) closeCard("landed"); }
+      else if (!cardWorthy(viewAc[i], exitNm) && minShown) closeCard("passed");
+    }
   }
   if (!cardShowing() && settings.show_card && !configOpen) {
+    float r = overheadNm();
     for (int i = 0; i < viewCount; i++) {   // nearest first
-      if (inOverhead(viewAc[i]) && strcmp(viewAc[i].hex, dismissedHex) != 0) { openCard(viewAc[i]); break; }
+      if (cardWorthy(viewAc[i], r) && strcmp(viewAc[i].hex, dismissedHex) != 0) { openCard(viewAc[i]); break; }
     }
   }
 }
@@ -2327,8 +2367,13 @@ void drawCard(const Aircraft& a, const struct tm* ti) {
   float b = bearingDeg(settings.home_lat, settings.home_lon, lat, lon);
   useFont(font20);
   spr.setTextDatum(TR_DATUM);
+  float cpaNm, cpaS;
+  closestApproach(a, cpaNm, cpaS);
+  String state = dMi * NM_PER_MI <= overheadNm() ? String("OVERHEAD")
+               : cpaS > 2 ? "OVERHEAD IN " + String((int)lroundf(cpaS)) + " s"
+               : String("PASSED");
   spr.setTextColor(COL_ALERT);
-  spr.drawString("OVERHEAD", SCREEN_W - 20, 16);
+  spr.drawString(state, SCREEN_W - 20, 16);
   useFont(font32);
   spr.setTextColor(TFT_WHITE);
   int distW = spr.drawString((dMi < 10 ? String(dMi, 1) : String((int)lroundf(dMi))) + " mi " + compass8(b),

@@ -94,9 +94,11 @@ off schedules.
 
 ## Overhead card
 
-When an airborne aircraft comes within the overhead radius of home (1 mile by
-default; 1, 2, 3 or 5 mi, at any altitude), the screen switches to a full-page
-card about it:
+When an airborne aircraft is about to pass within the overhead radius of home
+(1 mile by default; 1, 2, 3 or 5 mi, at any altitude), the screen switches to a
+full-page card about it. The card opens up to 60 s before the aircraft's
+predicted closest approach (from its speed and track), shows "OVERHEAD IN n s",
+then "OVERHEAD", then "PASSED". It stays up at least 45 s. The card shows:
 
 - callsign, operator, and live distance and direction from home
 - route, e.g. MSP → DEN (from adsb.lol's route database; hidden when the
@@ -107,8 +109,9 @@ card about it:
   silhouette pointing along its track
 - live altitude, vertical rate, speed, track and squawk (emergency codes in red)
 
-The card closes once the aircraft is 25% past the radius, lands or drops out
-of the feed. You can also tap it to close it; that aircraft won't reopen it
+After that, it closes once the aircraft has passed and is more than 25% outside
+the radius, or has landed. It closes at once if the aircraft drops out of the
+feed. You can also tap it to close it; that aircraft won't reopen it
 until it has left. The lookups take about 3–6 s, and the card shows the live
 data meanwhile.
 
