@@ -52,6 +52,7 @@
 void buildGammaLut();
 bool cardShowing();
 void closestApproach(const Aircraft& a, float& dNm, float& tSec);
+void closeCard(const char* why);
 
 // Drawing a smooth-font glyph alloca()s its whole bitmap.
 SET_LOOP_TASK_STACK_SIZE(FONTS_MAX_GLYPH_BYTES + 12 * 1024);
@@ -1422,6 +1423,7 @@ void handleSave() {
     la.trim(); lo.trim();
     double lat = la.toDouble(), lon = lo.toDouble();
     if (la.length() && lo.length() && lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180) {
+      if ((lat != settings.home_lat || lon != settings.home_lon) && cardShowing()) closeCard("home moved");
       settings.home_lat = lat;
       settings.home_lon = lon;
     }
