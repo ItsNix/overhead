@@ -34,11 +34,36 @@ ASCII = "".join(chr(c) for c in range(0x20, 0x7F))
 EXTRA = "\u00b0\u2192"   # degree sign; route arrow on the overhead card
 TEXT = ASCII + EXTRA
 TIME_CHARS = " 0123456789:"
-TIME_SIZE = 72
+TIME_SIZE = 72            # clock in the radar's side panel
+
+# Color clock face (shown while no aircraft are in range): the largest digits
+# for each format that fit TIME_MAX_W, leaving room for an AM/PM suffix drawn
+# in the 56 px text font. Same layout as colorclock.
+TIME_MAX_W = 760          # usable width for the time line (20 px margins)
+TIME_MAX_DIGIT_H = 200    # tallest digits that fit between hex code and date
+SUFFIX_GAP = 16           # space between digits and AM/PM
+SUFFIX_FONT_SIZE = 56
 
 
 def digit_advance(font):
     return max(font.getlength(d) for d in "0123456789")
+
+
+def time_width(font, pattern):
+    """Width of a time pattern like '88:88' with tabular digits."""
+    adv = digit_advance(font)
+    return sum(adv if ch == "8" else font.getlength(ch) for ch in pattern)
+
+
+def fit_time_size(pattern, suffix_w):
+    size = 400
+    while size > 20:
+        font = ImageFont.truetype(TTF, size)
+        digit_h = -font.getbbox("8", anchor="ls")[1]
+        if time_width(font, pattern) + suffix_w <= TIME_MAX_W and digit_h <= TIME_MAX_DIGIT_H:
+            return size
+        size -= 1
+    raise SystemExit(f"no size fits {pattern!r}")
 
 
 def make_vlw(size, chars, tabular_digits=False):
@@ -79,6 +104,15 @@ def c_array(name, data, comment):
 
 
 def main():
+    suffix_font = ImageFont.truetype(TTF, SUFFIX_FONT_SIZE)
+    suffix_w = max(suffix_font.getlength(s) for s in ("AM", "PM")) + SUFFIX_GAP
+
+    # Clock face sizes: L = no seconds (12h worst case, also used for 24h),
+    # M = 24h with seconds, S = 12h with seconds (needs room for AM/PM).
+    time_l = fit_time_size("88:88", suffix_w)
+    time_m = fit_time_size("88:88:88", 0)
+    time_s = fit_time_size("88:88:88", suffix_w)
+
     fonts = [
         ("FONT_TEXT_16", 16, TEXT, False, "DejaVu Sans Bold 16px, ASCII + degree, arrow"),
         ("FONT_TEXT_20", 20, TEXT, False, "DejaVu Sans Bold 20px, ASCII + degree, arrow"),
@@ -87,6 +121,9 @@ def main():
         ("FONT_TEXT_40", 40, TEXT, False, "DejaVu Sans Bold 40px, ASCII + degree, arrow"),
         ("FONT_TEXT_56", 56, TEXT, False, "DejaVu Sans Bold 56px, ASCII + degree, arrow"),
         ("FONT_TIME", TIME_SIZE, TIME_CHARS, True, f"DejaVu Sans Bold {TIME_SIZE}px, time digits"),
+        ("FONT_TIME_L", time_l, TIME_CHARS, True, f"DejaVu Sans Bold {time_l}px, clock face (no seconds)"),
+        ("FONT_TIME_M", time_m, TIME_CHARS, True, f"DejaVu Sans Bold {time_m}px, clock face (24h + seconds)"),
+        ("FONT_TIME_S", time_s, TIME_CHARS, True, f"DejaVu Sans Bold {time_s}px, clock face (12h + seconds)"),
     ]
 
     parts = [

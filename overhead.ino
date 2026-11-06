@@ -6,6 +6,8 @@
  * and a short trail. Positions are dead-reckoned between polls so they glide.
  * Right: clock, the nearest aircraft (tap one, on the radar or in the list,
  * for details), feed status and range buttons.
+ * While no aircraft are airborne within range, the colorclock face is shown
+ * instead (background = time as RGB); tap it to peek at the radar.
  *
  * Data source (web UI):
  *   - a local ADS-B receiver (readsb / dump1090 / tar1090 aircraft.json), and/or
@@ -46,6 +48,10 @@
 #include "smooth_font.h"
 #include "app_types.h"
 
+// Defined further down; Arduino's generated prototypes miss these.
+void buildGammaLut();
+bool cardShowing();
+
 // Drawing a smooth-font glyph alloca()s its whole bitmap.
 SET_LOOP_TASK_STACK_SIZE(FONTS_MAX_GLYPH_BYTES + 12 * 1024);
 
@@ -56,6 +62,13 @@ const char* AP_NAME            = "Overhead-Setup";
 const char* AP_PASSWORD        = "overhead";      // min 8 chars for WPA2
 const char* HOSTNAME           = "overhead";      // DHCP hostname
 const char* MDNS_NAME          = "overhead";      // → http://overhead.local
+#if defined(BOARD_CROWPANEL_7)
+const float DEFAULT_GAMMA      = 1.8f;    // TN panel: darken pale mid-tones
+#else
+const float DEFAULT_GAMMA      = 1.0f;    // IPS: start uncorrected, tune in the web UI
+#endif
+const float MIN_GAMMA          = 1.0f;
+const float MAX_GAMMA          = 3.0f;
 // Default home: Pocatello, Idaho (change it in the web UI).
 const double DEFAULT_LAT       = 42.8713;
 const double DEFAULT_LON       = -112.4455;
@@ -84,6 +97,9 @@ const char*    PROVIDER_NAMES[] = {"airplanes.live", "adsb.lol"};
 #define ALERT_FORGET_MS  600000     // an aircraft can beep again after this long away
 #define CARD_EXIT_FACTOR 1.25f      // card closes once the aircraft is this far past the radius
 #define RANGE_SAVE_MS    5000       // range buttons save to NVS after this long idle
+#define CLOCK_AFTER_MS   20000      // empty sky this long -> color clock
+#define PEEK_MS          30000      // a tap on the color clock shows the radar this long
+#define TIME_SUFFIX_GAP  16         // px between clock-face digits and AM/PM (matches make_fonts.py)
 
 // Layout: radar on the left, info panel on the right.
 #define RADAR_CX   240
@@ -113,6 +129,7 @@ void presentFrame() {
 
 // ── Smooth fonts (anti-aliased VLW, parsed once at boot from fonts.h) ──────
 SmoothFont font16, font20, font24, font32, font40, font56, fontTime;
+SmoothFont fontTimeL, fontTimeM, fontTimeS;   // clock face: no secs / 24h+secs / 12h+secs
 
 void loadFonts() {
   font16.load(FONT_TEXT_16);
@@ -122,6 +139,9 @@ void loadFonts() {
   font40.load(FONT_TEXT_40);
   font56.load(FONT_TEXT_56);
   fontTime.load(FONT_TIME);
+  fontTimeL.load(FONT_TIME_L);
+  fontTimeM.load(FONT_TIME_M);
+  fontTimeS.load(FONT_TIME_S);
 }
 
 void useFont(SmoothFont& f) {
@@ -136,6 +156,10 @@ struct Settings {
   String   ntp_server;
   String   tz_string;
   bool     format_24h;
+  bool     color_clock;  // color clock face while no aircraft are in range
+  bool     show_seconds; // clock face
+  bool     show_date;    // clock face
+  float    gamma;        // clock face background; 1.0 = off
   uint8_t  brightness;   // normal backlight, percent
   bool     dim_enabled;  // dim schedule
   uint16_t dim_start;    // minutes after midnight
@@ -159,6 +183,13 @@ struct Settings {
   bool     alert;        // also beep (buzzer boards)
 } settings;
 
+// ms since a millis() timestamp. Timestamps stored as "millis() | 1" (so 0
+// can mean "never") may be 1 ms in the future; that reads as 0, not ~49 days.
+uint32_t msSince(uint32_t t) {
+  int32_t d = (int32_t)(millis() - t);
+  return d < 0 ? 0 : d;
+}
+
 bool homeSet() { return settings.home_lat != 0 || settings.home_lon != 0; }
 
 // Smallest poll interval: local receivers are cheap; be polite to the free APIs.
@@ -174,6 +205,10 @@ void loadSettings() {
   settings.ntp_server   = prefs.getString("ntp",   DEFAULT_NTP);
   settings.tz_string    = prefs.getString("tz",    DEFAULT_TZ);
   settings.format_24h   = prefs.getBool  ("fmt24", true);
+  settings.color_clock  = prefs.getBool  ("cclock", true);
+  settings.show_seconds = prefs.getBool  ("secs",  true);
+  settings.show_date    = prefs.getBool  ("date",  true);
+  settings.gamma        = constrain(prefs.getFloat("gamma", DEFAULT_GAMMA), MIN_GAMMA, MAX_GAMMA);
   settings.brightness   = prefs.getUChar ("bright", 100);
   settings.dim_enabled  = prefs.getBool  ("dim",    false);
   settings.dim_start    = prefs.getUShort("dstart", 20 * 60);
@@ -203,6 +238,10 @@ void saveSettings() {
   prefs.putString("ntp",   settings.ntp_server);
   prefs.putString("tz",    settings.tz_string);
   prefs.putBool  ("fmt24", settings.format_24h);
+  prefs.putBool  ("cclock", settings.color_clock);
+  prefs.putBool  ("secs",  settings.show_seconds);
+  prefs.putBool  ("date",  settings.show_date);
+  prefs.putFloat ("gamma", settings.gamma);
   prefs.putUChar ("bright", settings.brightness);
   prefs.putBool  ("dim",    settings.dim_enabled);
   prefs.putUShort("dstart", settings.dim_start);
@@ -232,10 +271,11 @@ const char* sourceName(uint8_t s) {
 }
 
 void logSettings(const char* what) {
-  Serial.printf("%s: ntp=%s tz=%s 24h=%d bright=%u%% dim=%d %s-%s at %u%% off=%d %s-%s wake=%us "
+  Serial.printf("%s: ntp=%s tz=%s 24h=%d clock=%d secs=%d date=%d gamma=%.1f bright=%u%% dim=%d %s-%s at %u%% off=%d %s-%s wake=%us "
                 "home=%.5f,%.5f range=%unm src=%s prov=%s url=%s poll=%us labels=%d trails=%d "
                 "overhead=%umi card=%d beep=%d\n", what,
                 settings.ntp_server.c_str(), settings.tz_string.c_str(), settings.format_24h,
+                settings.color_clock, settings.show_seconds, settings.show_date, settings.gamma,
                 settings.brightness,
                 settings.dim_enabled, hhmm(settings.dim_start).c_str(), hhmm(settings.dim_end).c_str(),
                 settings.dim_level,
@@ -1175,6 +1215,16 @@ div#map{height:320px;margin-top:10px;border-radius:6px;background:#1a1a1a}
 <button type="button" onclick="fetch('/beep',{method:'POST'})">Test beep</button>
 </div>
 
+<h2>Color Clock</h2>
+<label class="cb"><input type="checkbox" name="cclock" %CCLOCK%> Show the color clock while no aircraft are in range</label>
+<div class="hint">Switches back to the radar as soon as an aircraft is airborne within range; tap the clock to look at the radar for 30 s.</div>
+<label class="cb"><input type="checkbox" name="secs" %SECS%> Show seconds</label>
+<label class="cb"><input type="checkbox" name="date" %DATE%> Show date line</label>
+<label>Color richness (gamma): <span id="gv">%GAMMA%</span></label>
+<input type="range" name="gamma" min="1.0" max="3.0" step="0.1" value="%GAMMA%"
+       oninput="document.getElementById('gv').textContent=this.value">
+<div class="hint">Higher darkens mid-tones for deeper colors on this panel. 1.0 = no correction.</div>
+
 <h2>Time</h2>
 <label>NTP Server</label>
 <input type="text" name="ntp" value="%NTP%">
@@ -1339,6 +1389,10 @@ void handleRoot() {
   html.replace("%NTP%",    htmlEscape(settings.ntp_server));
   html.replace("%TZ%",     htmlEscape(settings.tz_string));
   html.replace("%FMT24%",  settings.format_24h ? "checked" : "");
+  html.replace("%CCLOCK%", settings.color_clock ? "checked" : "");
+  html.replace("%SECS%",   settings.show_seconds ? "checked" : "");
+  html.replace("%DATE%",   settings.show_date ? "checked" : "");
+  html.replace("%GAMMA%",  String(settings.gamma, 1));
   html.replace("%BRIGHT%", String(settings.brightness));
   html.replace("%DIM%",    settings.dim_enabled ? "checked" : "");
   html.replace("%DSTART%", hhmm(settings.dim_start));
@@ -1355,6 +1409,7 @@ void handleRoot() {
 }
 
 bool configOpen = false;         // on-screen settings showing
+bool clockShowing = false;       // color clock face is on screen
 bool radarDirty = true;           // redraw now, not at the next REDRAW_MS tick
 uint32_t rangeSaveAt = 0;         // millis() to save after the range buttons; 0 = none
 
@@ -1382,6 +1437,13 @@ void handleSave() {
   if (server.hasArg("ntp")) settings.ntp_server = server.arg("ntp");
   if (server.hasArg("tz"))  settings.tz_string  = server.arg("tz");
   settings.format_24h = server.hasArg("fmt24");
+  settings.color_clock  = server.hasArg("cclock");
+  settings.show_seconds = server.hasArg("secs");
+  settings.show_date    = server.hasArg("date");
+  if (server.hasArg("gamma")) {
+    settings.gamma = constrain(server.arg("gamma").toFloat(), MIN_GAMMA, MAX_GAMMA);
+    buildGammaLut();
+  }
   if (server.hasArg("bright")) settings.brightness = constrain(server.arg("bright").toInt(), 5, 100);
   int t;
   settings.dim_enabled = server.hasArg("dim");
@@ -1409,8 +1471,9 @@ void handleStatus() {
   doc["source"] = feed.source;
   doc["count"]  = viewCount;
   doc["total"]  = feed.total;
-  doc["age"]    = feed.okAt ? (long)((millis() - feed.okAt) / 1000) : -1L;
+  doc["age"]    = feed.okAt ? (long)(msSince(feed.okAt) / 1000) : -1L;
   doc["error"]  = feed.error;
+  doc["view"]   = cardShowing() ? "card" : clockShowing ? "clock" : "radar";
   if (viewCount) {
     const Aircraft& a = viewAc[0];
     doc["nearest"] = aircraftName(a) + " " + altString(a.alt) +
@@ -1426,7 +1489,7 @@ void handleStatus() {
 void handleAircraft() {
   JsonDocument doc;
   doc["source"] = feed.source;
-  doc["age_s"]  = feed.okAt ? (long)((millis() - feed.okAt) / 1000) : -1L;
+  doc["age_s"]  = feed.okAt ? (long)(msSince(feed.okAt) / 1000) : -1L;
   JsonArray list = doc["aircraft"].to<JsonArray>();
   for (int i = 0; i < viewCount; i++) {
     const Aircraft& a = viewAc[i];
@@ -1952,13 +2015,13 @@ void drawStatusLine(uint32_t now) {
   int cx = PANEL_X + PANEL_W / 2;
   String line;
   uint16_t col = COL_DIM_TEXT;
-  bool stale = !feed.okAt || now - feed.okAt > STALE_MS;
+  bool stale = !feed.okAt || msSince(feed.okAt) > STALE_MS;
   if (!wifiOnline)            { line = "No WiFi"; col = COL_WARN; }
   else if (!homeSet())        { line = "Home location not set"; col = COL_WARN; }
   else if (stale && feed.error[0]) { line = feed.error; col = COL_WARN; }
   else if (!feed.okAt)        { line = "Connecting..."; }
   else {
-    line = String(feed.source) + "  " + viewCount + " aircraft  " + (now - feed.okAt) / 1000 + "s";
+    line = String(feed.source) + "  " + viewCount + " aircraft  " + msSince(feed.okAt) / 1000 + "s";
     if (feed.error[0]) col = COL_WARN;     // fell back from the receiver
   }
   while (spr.textWidth(line) > PANEL_W - 12 && line.length() > 4) line.remove(line.length() - 1);
@@ -1978,6 +2041,140 @@ void drawRangeButtons() {
   spr.setTextDatum(MC_DATUM);
   spr.setTextColor(TFT_WHITE);
   spr.drawString(String(settings.range_nm) + " nm", PANEL_X + PANEL_W / 2, cy);
+}
+
+// ── Color clock face (from colorclock) ────────────────────────────────────
+// Shown while no aircraft are airborne within range. Background = the time as
+// RGB: R = hour/23, G = minute/59, B = second/59, each scaled to 0-255; text
+// in whichever gray contrasts best.
+inline uint8_t mapH(int h) { return (uint8_t)((h * 255) / 23); }
+inline uint8_t mapM(int m) { return (uint8_t)((m * 255) / 59); }
+inline uint8_t mapS(int s) { return (uint8_t)((s * 255) / 59); }
+
+// Background gamma correction: the basic board's TN panel shows mid-tones
+// pale. The hex and R/G/B readouts still show the uncorrected values.
+uint8_t gammaLut[256];
+
+void buildGammaLut() {
+  for (int i = 0; i < 256; i++) gammaLut[i] = (uint8_t)lroundf(powf(i / 255.0f, settings.gamma) * 255.0f);
+}
+
+static uint16_t linearise(uint8_t c) {
+  float cf  = c / 255.0f;
+  float lin = (cf <= 0.04045f) ? (cf / 12.92f) : powf((cf + 0.055f) / 1.055f, 2.4f);
+  return (uint16_t)(lin * 1000.0f);
+}
+
+static uint32_t luminance1000(uint8_t r, uint8_t g, uint8_t b) {
+  return (212UL * linearise(r) + 715UL * linearise(g) + 72UL * linearise(b)) / 1000UL;
+}
+
+// WCAG contrast ratio x100 between two luminances (x1000).
+static uint32_t contrastRatio100(uint32_t L1, uint32_t L2) {
+  uint32_t hi = max(L1, L2) + 50, lo = min(L1, L2) + 50;
+  return (hi * 100UL) / lo;
+}
+
+uint16_t bestTextColor(uint8_t r, uint8_t g, uint8_t b) {
+  uint32_t bgLum = luminance1000(r, g, b);
+  static const uint8_t grays[] = {255, 0, 180, 80};
+  uint32_t bestCR = 0;
+  uint16_t bestCol = TFT_WHITE;
+  for (uint8_t v : grays) {
+    uint32_t cr = contrastRatio100(bgLum, luminance1000(v, v, v));
+    if (cr > bestCR) { bestCR = cr; bestCol = rgb888to565(v, v, v); }
+  }
+  return bestCol;
+}
+
+// Digits only ("13:05:09" or "1:05:09"); AM/PM drawn separately.
+String clockDigits(const struct tm& ti) {
+  String out;
+  if (settings.format_24h) out = pad2(ti.tm_hour);
+  else { int h12 = ti.tm_hour % 12; out = String(h12 ? h12 : 12); }
+  out += ":" + pad2(ti.tm_min);
+  if (settings.show_seconds) out += ":" + pad2(ti.tm_sec);
+  return out;
+}
+
+void drawColorClock(const struct tm* ti) {
+  if (!ti) {   // no time yet (basic board before NTP): plain screen
+    drawStatus("Overhead", "Waiting for the time...", TFT_CYAN);
+    presentFrame();
+    return;
+  }
+  uint8_t R = mapH(ti->tm_hour), G = mapM(ti->tm_min), B = mapS(ti->tm_sec);
+  uint8_t dR = gammaLut[R], dG = gammaLut[G], dB = gammaLut[B];   // as displayed
+  uint16_t bg = rgb888to565(dR, dG, dB);
+  uint16_t fg = bestTextColor(dR, dG, dB);
+  spr.fillSprite(bg);
+  spr.setTextColor(fg, bg);
+  spr.setTextDatum(MC_DATUM);
+
+  char hex[8];
+  snprintf(hex, sizeof(hex), "#%02X%02X%02X", R, G, B);
+  useFont(font56);
+  spr.drawString(hex, SCREEN_W / 2, 50);
+
+  // Time: digits pre-rendered at the size for this format, AM/PM beside them.
+  String digits = clockDigits(*ti);
+  const char* suffix = settings.format_24h ? "" : ti->tm_hour < 12 ? "AM" : "PM";
+  SmoothFont& tf = !settings.show_seconds ? fontTimeL : settings.format_24h ? fontTimeM : fontTimeS;
+  useFont(tf);
+  int digitsW = spr.textWidth(digits), digitsH = spr.fontHeight(), suffixW = 0;
+  if (*suffix) { useFont(font56); suffixW = TIME_SUFFIX_GAP + spr.textWidth(suffix); }
+  int x = (SCREEN_W - digitsW - suffixW) / 2;
+  int baseline = (settings.show_date ? 205 : 240) + digitsH / 2;
+  spr.setTextDatum(L_BASELINE);
+  useFont(tf);
+  spr.drawString(digits, x, baseline);
+  if (*suffix) { useFont(font56); spr.drawString(suffix, x + digitsW + TIME_SUFFIX_GAP, baseline); }
+  spr.setTextDatum(MC_DATUM);
+
+  if (settings.show_date) {
+    useFont(font56);
+    spr.drawString(String(dayNames[ti->tm_wday]) + "  " + pad2(ti->tm_mday) + " " +
+                   monthNames[ti->tm_mon] + " " + String(1900 + ti->tm_year), SCREEN_W / 2, 365);
+  }
+  useFont(font24);
+  char rgb[28];
+  snprintf(rgb, sizeof(rgb), "R:%3d   G:%3d   B:%3d", R, G, B);
+  spr.drawString(rgb, SCREEN_W / 2, 450);
+
+  // Corner tag when the sky only looks empty because there's no data.
+  const char* tag = !wifiOnline ? "No WiFi"
+                  : (!feed.okAt || msSince(feed.okAt) > STALE_MS) ? "No aircraft data" : nullptr;
+  if (tag) {
+    spr.setTextDatum(TR_DATUM);
+    spr.drawString(tag, SCREEN_W - 16, 12);
+    spr.setTextDatum(MC_DATUM);
+  }
+  presentFrame();
+}
+
+// Which view the main screen shows when there's no overhead card.
+uint32_t lastAircraftAt = 0;      // millis() when aircraft were last in range; 0 = never
+uint32_t peekUntil = 0;           // radar forced on by a tap on the clock; 0 = none
+
+int aircraftInRange() {
+  int n = 0;
+  for (int i = 0; i < viewCount; i++) {
+    if (viewAc[i].alt != ALT_GROUND && viewAc[i].dist_nm <= settings.range_nm) n++;
+  }
+  return n;
+}
+
+// Radar while aircraft are airborne within range; the color clock once the sky
+// has been empty (or the feed down) for CLOCK_AFTER_MS, or before any aircraft
+// have been seen. A tap on the clock peeks at the radar for PEEK_MS.
+bool showClockFace() {
+  if (!settings.color_clock || !homeSet()) return false;
+  uint32_t now = millis();
+  if (peekUntil && (int32_t)(now - peekUntil) < 0) return false;
+  peekUntil = 0;
+  bool fresh = feed.okAt && msSince(feed.okAt) <= STALE_MS;
+  if (fresh && aircraftInRange() > 0) lastAircraftAt = now | 1;
+  return !lastAircraftAt || msSince(lastAircraftAt) >= CLOCK_AFTER_MS;
 }
 
 void drawFrame(const struct tm* ti) {
@@ -2234,6 +2431,10 @@ void handleViewTouch() {
     closeCard("tapped");
     return;
   }
+  if (clockShowing) {
+    peekUntil = (millis() + PEEK_MS) | 1;
+    return;
+  }
   if (x < PANEL_X) {
     int best = -1, bestD = 40 * 40;
     for (int i = 0; i < hitCount; i++) {
@@ -2276,15 +2477,15 @@ void handleViewTouch() {
 #define REPEAT_MS         120
 #define DIM_PREVIEW_MS    2000    // show the dim level this long after changing it
 
-#define TAB_W     160             // 4 page tabs + Done across the top
+#define TAB_W     (SCREEN_W / 6)  // 5 page tabs + Done across the top
 #define HEADER_H  80
 #define ROWS_Y    100
 #define ROW_H     85
 #define CTRL_H    64
 #define FOOTER_Y  (SCREEN_H - 20)   // IP address line, below the last row
 
-const char* configTabs[] = {"Radar", "Dim", "Off", "Overhead"};
-int configPageCount() { return 4; }
+const char* configTabs[] = {"Radar", "Clock", "Dim", "Off", "Overhead"};
+int configPageCount() { return 5; }
 
 int configRows(int page, ConfigRow* rows) {
   switch (page) {
@@ -2295,12 +2496,18 @@ int configRows(int page, ConfigRow* rows) {
       rows[3] = {"Trails",       ROW_TOGGLE,  &settings.trails};
       return 4;
     case 1:
+      rows[0] = {"Color clock",  ROW_TOGGLE,  &settings.color_clock};
+      rows[1] = {"24-hour",      ROW_TOGGLE,  &settings.format_24h};
+      rows[2] = {"Seconds",      ROW_TOGGLE,  &settings.show_seconds};
+      rows[3] = {"Date",         ROW_TOGGLE,  &settings.show_date};
+      return 4;
+    case 2:
       rows[0] = {"Dim screen",   ROW_TOGGLE,  &settings.dim_enabled};
       rows[1] = {"From",         ROW_TIME,    &settings.dim_start};
       rows[2] = {"Until",        ROW_TIME,    &settings.dim_end};
       rows[3] = {"Brightness",   ROW_PERCENT, &settings.dim_level, 5, 100};
       return 4;
-    case 2:
+    case 3:
       rows[0] = {"Screen off",   ROW_TOGGLE,  &settings.off_enabled};
       rows[1] = {"From",         ROW_TIME,    &settings.off_start};
       rows[2] = {"Until",        ROW_TIME,    &settings.off_end};
@@ -2396,10 +2603,12 @@ void drawConfig(const ConfigRow* rows, int n) {
     useFont(font40);
     if (spr.textWidth(configTabs[t]) > TAB_W - 28) useFont(font32);
     if (spr.textWidth(configTabs[t]) > TAB_W - 28) useFont(font24);
+    if (spr.textWidth(configTabs[t]) > TAB_W - 28) useFont(font20);
     drawButton(t * TAB_W + 6, 8, TAB_W - 12, HEADER_H - 16, active ? COL_ACCENT : PANEL,
                configTabs[t], active ? TFT_BLACK : TFT_WHITE);
   }
-  drawButton(4 * TAB_W + 6, 8, TAB_W - 12, HEADER_H - 16, GREEN, "Done", TFT_WHITE);
+  useFont(font32);
+  drawButton(configPageCount() * TAB_W + 6, 8, TAB_W - 12, HEADER_H - 16, GREEN, "Done", TFT_WHITE);
 
   for (int i = 0; i < n; i++) {
     const ConfigRow& r = rows[i];
@@ -2460,7 +2669,7 @@ void handleConfigTouch(const ConfigRow* rows, int n) {
   int x = touch.x, y = touch.y;
   if (y < HEADER_H) {
     int slot = x / TAB_W;
-    if (slot == 4) { closeConfig(); return; }
+    if (slot == configPageCount()) { closeConfig(); return; }
     if (slot < configPageCount() && slot != configPage) { configPage = slot; configDirty = true; }
     return;
   }
@@ -2528,6 +2737,7 @@ void setup() {
   spr.setTextDatum(MC_DATUM);
 
   loadSettings();
+  buildGammaLut();
   restoreTimeFromRtc();
   trails = (Trail*)heap_caps_calloc(MAX_TRAILS, sizeof(Trail), MALLOC_CAP_SPIRAM);
 
@@ -2593,12 +2803,21 @@ void loop() {
   if (pullCard()) radarDirty = true;
 
   static uint32_t lastDraw = 0;
+  static int lastSec = -1;
+  if (clockShowing && haveTime && ti.tm_sec != lastSec) radarDirty = true;   // clock face ticks on the second
+  if (haveTime) lastSec = ti.tm_sec;
   if (radarDirty || millis() - lastDraw >= REDRAW_MS) {
     radarDirty = false;
     lastDraw = millis();
     int c = cardShowing() ? findAircraft(cardHex) : -1;
-    if (c >= 0) drawCard(viewAc[c], haveTime ? &ti : nullptr);
-    else        drawFrame(haveTime ? &ti : nullptr);
+    bool clock = c < 0 && showClockFace();
+    if (clock != clockShowing) {
+      clockShowing = clock;
+      Serial.println(clock ? "View: color clock (no aircraft in range)" : "View: radar");
+    }
+    if (c >= 0)     drawCard(viewAc[c], haveTime ? &ti : nullptr);
+    else if (clock) drawColorClock(haveTime ? &ti : nullptr);
+    else            drawFrame(haveTime ? &ti : nullptr);
   } else {
     delay(beepStep ? 5 : 15);
   }

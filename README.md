@@ -7,6 +7,14 @@ altitude, with its callsign, altitude, a climb/descent arrow and a short trail.
 Positions are extrapolated between updates so the icons move smoothly. On the
 right are a clock, the nearest aircraft, the feed status and range buttons.
 
+When no aircraft are airborne within range, the screen switches to the
+[colorclock](https://github.com/ItsNix/colorclock) face: the background color is
+the time (red = hour, green = minute, blue = second), with the hex code, time,
+date and RGB values on top. It goes back to the radar as soon as an aircraft
+comes into range, and returns to the clock after about 20 s of empty sky. Tap
+the clock to look at the radar for 30 s. A small corner tag shows "No WiFi" or
+"No aircraft data" when the sky is only empty because the feed is down.
+
 Built on the display and board code from
 [colorclock](https://github.com/ItsNix/colorclock).
 
@@ -76,12 +84,13 @@ splash is showing.
   the card to close it.
 - **− / +** change the range (2–250 nm).
 - **Tap the top-left and top-right corners** within 5 s to open the on-screen
-  settings: brightness, range, labels, trails, dim/off schedules, and the
-  overhead radius, card and beep.
+  settings: brightness, range, labels, trails, color clock (on/off, 24 h,
+  seconds, date), dim/off schedules, and the overhead radius, card and beep.
 
 Web UI settings: home location (map picker), range, labels, trails, data source
-(receiver URL, online feed, poll interval), overhead radius / card / beep, time
-zone, 12/24 h, brightness, dim and off schedules.
+(receiver URL, online feed, poll interval), overhead radius / card / beep, color
+clock (on/off, seconds, date, gamma), time zone, 12/24 h, brightness, dim and
+off schedules.
 
 ## Overhead card
 
