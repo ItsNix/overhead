@@ -53,6 +53,7 @@ void buildGammaLut();
 bool cardShowing();
 void closestApproach(const Aircraft& a, float& dNm, float& tSec);
 void closeCard(const char* why);
+void startPortal(const char* reason);
 
 // Drawing a smooth-font glyph alloca()s its whole bitmap.
 SET_LOOP_TASK_STACK_SIZE(FONTS_MAX_GLYPH_BYTES + 12 * 1024);
@@ -1283,6 +1284,10 @@ div#map{height:320px;margin-top:10px;border-radius:6px;background:#1a1a1a}
 
 <hr>
 
+<form action="/wifi_setup" method="POST"
+      onsubmit="return confirm('Open the Overhead-Setup hotspot to pick a different network?')">
+<button type="submit">Change WiFi Network</button>
+</form>
 <form action="/reset_wifi" method="POST"
       onsubmit="return confirm('Wipe saved WiFi credentials and reboot?')">
 <button type="submit" class="danger">Reset WiFi Credentials</button>
@@ -1413,6 +1418,7 @@ void handleRoot() {
 }
 
 bool configOpen = false;         // on-screen settings showing
+bool portalOpen = false;         // WiFi setup portal running (on demand)
 bool clockShowing = false;       // color clock face is on screen
 bool radarDirty = true;           // redraw now, not at the next REDRAW_MS tick
 uint32_t rangeSaveAt = 0;         // millis() to save after the range buttons; 0 = none
@@ -1509,6 +1515,17 @@ void handleAircraft() {
   server.send(200, "application/json", out);
 }
 
+// Opens the setup hotspot without forgetting the saved network.
+void handleWiFiSetup() {
+  server.send(200, "text/html",
+    "<body style='font-family:sans-serif;background:#111;color:#eee;padding:30px'>"
+    "<h1>WiFi setup</h1><p>Join the <b>Overhead-Setup</b> network (password <b>overhead</b>) "
+    "and pick the new network. The display stays on the old one until then, and closes the "
+    "setup after 10 minutes.</p></body>");
+  delay(300);
+  startPortal("Opened from the web page");
+}
+
 void handleResetWiFi() {
   server.send(200, "text/html",
     "<meta http-equiv='refresh' content='3'>"
@@ -1563,6 +1580,7 @@ void setupWebServer() {
   server.on("/status",    handleStatus);
   server.on("/aircraft.json", handleAircraft);
   server.on("/reset_wifi",HTTP_POST, handleResetWiFi);
+  server.on("/wifi_setup",HTTP_POST, handleWiFiSetup);
   server.on("/panel",     handlePanel);
   server.on("/snap",      handleSnap);
   server.on("/beep",      HTTP_POST, handleBeep);
@@ -1579,10 +1597,13 @@ void setupWebServer() {
 #define WIFI_CONNECT_MS  20000   // boot: wait this long for saved credentials
 #define WIFI_RETRY_MS    30000   // offline: reconnect attempt interval
 
-// Boot only. With saved credentials that don't connect in time, the display
-// runs offline (no aircraft) if the time is known (RTC) and loop() keeps
-// retrying. The setup portal opens without saved credentials, after a
-// touch-hold reset, or when there is no other way to get the time.
+// Boot only. With saved credentials that don't connect in time while the time
+// is already known (Advance RTC), the setup portal opens in the background
+// (bootPortal) so the network can be changed without pulling the RTC cell;
+// the clock keeps running and loop() keeps retrying. Without the time, the
+// blocking portal opens as before (nothing to show without WiFi anyway).
+bool bootPortal = false;
+
 void setupWiFi() {
   WiFiManager wm;
   wm.setConfigPortalTimeout(180);
@@ -1607,8 +1628,8 @@ void setupWiFi() {
       if (WiFi.status() == WL_CONNECTED) { connected = true; break; }
     }
     if (!connected && timeKnown()) {
-      showStatus("WiFi unavailable", "Running offline", TFT_ORANGE);
-      delay(2500);
+      Serial.printf("WiFi: saved network \"%s\" didn't connect\n", wm.getWiFiSSID().c_str());
+      bootPortal = true;
       return;
     }
   }
@@ -1649,9 +1670,112 @@ void checkWiFi() {
       Serial.println("WiFi lost; retrying in the background");
     }
   }
-  if (!up && millis() - lastTry >= WIFI_RETRY_MS) {
+  if (!up && !portalOpen && millis() - lastTry >= WIFI_RETRY_MS) {
     lastTry = millis();
     WiFi.reconnect();
+  }
+}
+
+// ── WiFi setup portal, on demand (non-blocking) ───────────────────────────
+// Opened from the on-screen settings, the web UI, or at boot when the saved
+// network doesn't connect but the clock has the time. Runs the WiFiManager
+// hotspot alongside the clock until a network is saved, Cancel is tapped, or
+// PORTAL_MS passes; then reconnects to the saved network.
+#define PORTAL_MS (10 * 60 * 1000UL)
+
+WiFiManager portalWm;
+uint32_t    portalSince = 0;
+String      portalReason;
+
+void startPortal(const char* reason) {
+  if (portalOpen) return;
+  Serial.printf("WiFi setup portal opened (%s)\n", reason);
+  portalReason = reason;
+  server.stop();                       // the portal serves its own pages on port 80
+  WiFi.setHostname(HOSTNAME);
+  portalWm.setDebugOutput(false);
+  portalWm.setConfigPortalBlocking(false);
+  portalWm.setConfigPortalTimeout(0);  // ours, so the screen can count it down
+  portalWm.startConfigPortal(AP_NAME, AP_PASSWORD);
+  portalOpen = true;
+  portalSince = millis();
+  radarDirty = true;
+}
+
+void stopPortal(bool saved, const char* why) {
+  if (!portalOpen) return;
+  portalOpen = false;
+  if (!saved) portalWm.stopConfigPortal();
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname(HOSTNAME);
+  if (WiFi.status() != WL_CONNECTED) WiFi.begin();   // saved (maybe new) network
+  server.begin();
+  radarDirty = true;
+  Serial.printf("WiFi setup portal closed (%s)\n", why);
+}
+
+#define PORTAL_BTN_X 520
+#define PORTAL_BTN_Y 400
+#define PORTAL_BTN_W 260
+#define PORTAL_BTN_H 64
+
+void drawPortal(const struct tm* ti) {
+  uint32_t left = PORTAL_MS > msSince(portalSince) ? (PORTAL_MS - msSince(portalSince)) / 1000 : 0;
+  spr.fillSprite(TFT_BLUE);
+  spr.setTextDatum(MC_DATUM);
+  spr.setTextColor(TFT_WHITE, TFT_BLUE);
+  useFont(font40);
+  spr.drawString("WiFi Setup", SCREEN_W / 2, 36);
+  useFont(font20);
+  spr.drawString(portalReason, SCREEN_W / 2, 76);
+  useFont(font32);
+  spr.drawString("On your phone, join:", SCREEN_W / 2, 130);
+  useFont(font56);
+  spr.setTextColor(TFT_YELLOW, TFT_BLUE);
+  spr.drawString(AP_NAME, SCREEN_W / 2, 190);
+  useFont(font32);
+  spr.setTextColor(TFT_WHITE, TFT_BLUE);
+  spr.drawString(String("Password: ") + AP_PASSWORD, SCREEN_W / 2, 250);
+  spr.drawString("then pick your network", SCREEN_W / 2, 296);
+  useFont(font20);
+  spr.drawString("(page opens by itself, or go to 192.168.4.1)", SCREEN_W / 2, 336);
+
+  spr.setTextDatum(ML_DATUM);
+  String saved = portalWm.getWiFiSSID();
+  spr.drawString(saved.length() ? "Saved network: " + saved : String("No saved network"), 24, 400);
+  char t[40];
+  snprintf(t, sizeof(t), "Closes in %lu:%02lu", (unsigned long)(left / 60), (unsigned long)(left % 60));
+  spr.drawString(t, 24, 434);
+  if (ti) {
+    char clk[12];
+    snprintf(clk, sizeof(clk), "%02d:%02d", ti->tm_hour, ti->tm_min);
+    spr.drawString(String("Time ") + clk, 24, 464);
+  }
+  useFont(font32);
+  spr.setTextDatum(MC_DATUM);
+  spr.fillRoundRect(PORTAL_BTN_X, PORTAL_BTN_Y, PORTAL_BTN_W, PORTAL_BTN_H, 12, rgb888to565(58, 58, 66));
+  spr.setTextColor(TFT_WHITE);
+  spr.drawString("Cancel", PORTAL_BTN_X + PORTAL_BTN_W / 2, PORTAL_BTN_Y + PORTAL_BTN_H / 2);
+  presentFrame();
+}
+
+// One loop pass while the portal is open.
+void runPortal(const struct tm* ti) {
+  if (portalWm.process())                 { stopPortal(true,  "connected to the new network"); return; }
+  if (!portalWm.getConfigPortalActive())  { stopPortal(true,  "exit from the setup page"); return; }
+  if (msSince(portalSince) >= PORTAL_MS)  { stopPortal(false, "timed out"); return; }
+  if (touch.started && touch.x >= PORTAL_BTN_X && touch.y >= PORTAL_BTN_Y - 20) {
+    stopPortal(false, "cancelled");
+    return;
+  }
+  setBacklightLevel(settings.brightness, "wifi setup");
+  static uint32_t lastDraw = 0;
+  if (radarDirty || msSince(lastDraw) >= 1000) {
+    radarDirty = false;
+    lastDraw = millis() | 1;
+    drawPortal(ti);
+  } else {
+    delay(10);
   }
 }
 
@@ -2529,7 +2653,11 @@ void handleViewTouch() {
 #define ROWS_Y    100
 #define ROW_H     85
 #define CTRL_H    64
-#define FOOTER_Y  (SCREEN_H - 20)   // IP address line, below the last row
+#define FOOTER_Y  (SCREEN_H - 20)   // WiFi line, below the last row
+#define WIFI_BTN_X 570              // "Change WiFi" button in the footer
+#define WIFI_BTN_Y 442
+#define WIFI_BTN_W 220
+#define WIFI_BTN_H 36
 
 const char* configTabs[] = {"Radar", "Clock", "Dim", "Off", "Overhead"};
 int configPageCount() { return 5; }
@@ -2683,12 +2811,18 @@ void drawConfig(const ConfigRow* rows, int n) {
     }
   }
 
+  // Footer: network and IP, and a button to change the network (works offline too).
   configIp = currentIp();
-  if (configIp.length()) {
-    useFont(font24);
-    spr.setTextColor(rgb888to565(150, 150, 160), BG);
-    spr.drawString("IP: " + configIp, SCREEN_W / 2, FOOTER_Y);
-  }
+  useFont(font20);
+  spr.setTextDatum(ML_DATUM);
+  spr.setTextColor(rgb888to565(150, 150, 160), BG);
+  String ssid = WiFi.SSID();
+  if (!ssid.length()) ssid = portalWm.getWiFiSSID();
+  String line = configIp.length() ? "WiFi: " + ssid + "   IP: " + configIp
+                                  : "WiFi: not connected" + (ssid.length() ? " (" + ssid + ")" : String(""));
+  spr.drawString(line, 24, FOOTER_Y);
+  spr.setTextDatum(MC_DATUM);
+  drawButton(WIFI_BTN_X, WIFI_BTN_Y, WIFI_BTN_W, WIFI_BTN_H, PANEL, "Change WiFi", TFT_WHITE);
   presentFrame();
 }
 
@@ -2718,6 +2852,11 @@ void handleConfigTouch(const ConfigRow* rows, int n) {
     int slot = x / TAB_W;
     if (slot == configPageCount()) { closeConfig(); return; }
     if (slot < configPageCount() && slot != configPage) { configPage = slot; configDirty = true; }
+    return;
+  }
+  if (y >= WIFI_BTN_Y - 10 && x >= WIFI_BTN_X) {
+    closeConfig();
+    startPortal("Opened from the on-screen settings");
     return;
   }
   int i = (y - ROWS_Y) / ROW_H;
@@ -2804,6 +2943,7 @@ void setup() {
   applyTimeSettings();
   setupWebServer();
   startFetchTask();
+  if (bootPortal) startPortal("Saved network didn't connect. The clock keeps running.");
 }
 
 // ── Loop ────────────────────────────────────────────────────────────────────
@@ -2816,6 +2956,13 @@ void loop() {
   if (ntpSynced) {
     ntpSynced = false;
     if (display.writeRtc(time(nullptr))) Serial.println("RTC set from NTP");
+  }
+
+  if (portalOpen) {
+    struct tm pt;
+    bool pk = getLocalTime(&pt, 0);
+    runPortal(pk ? &pt : nullptr);
+    return;
   }
 
   if (configOpen) {

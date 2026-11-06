@@ -74,8 +74,21 @@ PSRAM and panics at boot.
    search for an address, click the map, or drag the pin. The default is
    Pocatello, Idaho. The map uses OpenStreetMap tiles, so no API key is needed.
 
-To forget the saved WiFi network, touch and hold the screen while the boot
-splash is showing.
+### Changing the WiFi network
+
+Any of these opens the **`Overhead-Setup`** hotspot (password `overhead`) for
+up to 10 minutes. Join it from a phone and pick the new network. The display
+keeps running meanwhile and stays on the old network until a new one is saved.
+
+- **On screen:** open the settings (top-left then top-right corner) and tap
+  **Change WiFi** at the bottom. This works when the display is offline too.
+- **Web page:** **Change WiFi Network** at the bottom.
+- **Automatically at boot** if the saved network doesn't connect. On the
+  Advance the RTC already has the time, so it used to run offline silently;
+  now it shows the setup screen, with a **Cancel** button to run offline.
+
+To forget the saved network entirely, touch and hold the screen while the boot
+splash is showing, or use **Reset WiFi Credentials** on the web page.
 
 ## Using it
 
