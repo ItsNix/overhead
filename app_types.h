@@ -64,3 +64,24 @@ struct Trail {
   float    lat[TRAIL_POINTS], lon[TRAIL_POINTS];
   uint32_t lastSeen;      // millis()
 };
+
+// Extra details for the overhead card, looked up by the fetch task:
+// route (adsb.lol), aircraft (hexdb.io), photo (planespotters.net).
+struct CardInfo {
+  char     hex[7];             // the aircraft these are for; "" = none
+  bool     done;               // lookups finished (any may have failed)
+  char     from_code[5], to_code[5];      // IATA, else ICAO
+  char     from_city[40], to_city[40];
+  char     model[48];          // e.g. "Boeing 737NG 924ER/W"
+  char     owner[48];          // registered owner / operator
+  char     photographer[48];
+  uint8_t* jpg;                // PSRAM; owned by whoever holds the CardInfo
+  size_t   jpg_len;
+};
+
+// What the loop wants looked up (copied to the fetch task under the data mutex).
+struct CardRequest {
+  char   hex[7];               // "" = nothing
+  char   callsign[9];
+  double lat, lon;
+};

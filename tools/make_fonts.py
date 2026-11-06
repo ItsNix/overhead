@@ -31,6 +31,8 @@ TTF = sys.argv[1] if len(sys.argv) > 1 else "/usr/share/fonts/TTF/DejaVuSans-Bol
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "fonts.h")
 
 ASCII = "".join(chr(c) for c in range(0x20, 0x7F))
+EXTRA = "\u00b0\u2192"   # degree sign; route arrow on the overhead card
+TEXT = ASCII + EXTRA
 TIME_CHARS = " 0123456789:"
 TIME_SIZE = 72
 
@@ -78,12 +80,12 @@ def c_array(name, data, comment):
 
 def main():
     fonts = [
-        ("FONT_TEXT_16", 16, ASCII, False, "DejaVu Sans Bold 16px, ASCII"),
-        ("FONT_TEXT_20", 20, ASCII + "\u00b0", False, "DejaVu Sans Bold 20px, ASCII + degree sign"),
-        ("FONT_TEXT_24", 24, ASCII, False, "DejaVu Sans Bold 24px, ASCII"),
-        ("FONT_TEXT_32", 32, ASCII, False, "DejaVu Sans Bold 32px, ASCII"),
-        ("FONT_TEXT_40", 40, ASCII, False, "DejaVu Sans Bold 40px, ASCII"),
-        ("FONT_TEXT_56", 56, ASCII, False, "DejaVu Sans Bold 56px, ASCII"),
+        ("FONT_TEXT_16", 16, TEXT, False, "DejaVu Sans Bold 16px, ASCII + degree, arrow"),
+        ("FONT_TEXT_20", 20, TEXT, False, "DejaVu Sans Bold 20px, ASCII + degree, arrow"),
+        ("FONT_TEXT_24", 24, TEXT, False, "DejaVu Sans Bold 24px, ASCII + degree, arrow"),
+        ("FONT_TEXT_32", 32, TEXT, False, "DejaVu Sans Bold 32px, ASCII + degree, arrow"),
+        ("FONT_TEXT_40", 40, TEXT, False, "DejaVu Sans Bold 40px, ASCII + degree, arrow"),
+        ("FONT_TEXT_56", 56, TEXT, False, "DejaVu Sans Bold 56px, ASCII + degree, arrow"),
         ("FONT_TIME", TIME_SIZE, TIME_CHARS, True, f"DejaVu Sans Bold {TIME_SIZE}px, time digits"),
     ]
 

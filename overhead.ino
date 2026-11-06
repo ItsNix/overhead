@@ -16,8 +16,8 @@
  *
  * Configurable via web UI at http://overhead.local (or device IP): home
  * location, range, data source, labels / trails, time zone, brightness, dim and
- * off schedules, overhead alert (Advance board's buzzer). Range, brightness,
- * schedules and alert are also on screen: tap the top-left and top-right
+ * off schedules, and the overhead card / beep. Range, brightness, schedules and
+ * overhead options are also on screen: tap the top-left and top-right
  * corners within 5 s.
  *
  * Libraries (install via Library Manager):
@@ -61,11 +61,12 @@ const double DEFAULT_LAT       = 42.8713;
 const double DEFAULT_LON       = -112.4455;
 const char* USER_AGENT         = "overhead-esp32/1.0 (+https://github.com/ItsNix/overhead)";
 
-// Range presets (nm) for the radar, and for the overhead alert.
+// Range presets (nm) for the radar, and overhead radius presets (statute miles).
 const uint16_t RANGE_CHOICES[] = {2, 5, 10, 15, 25, 50, 100, 150, 250};
 const uint8_t  RANGE_COUNT     = sizeof(RANGE_CHOICES) / sizeof(RANGE_CHOICES[0]);
-const uint16_t ALERT_CHOICES[] = {1, 2, 3, 5, 10};
-const uint8_t  ALERT_COUNT     = sizeof(ALERT_CHOICES) / sizeof(ALERT_CHOICES[0]);
+const uint16_t OVERHEAD_CHOICES[] = {1, 2, 3, 5};
+const uint8_t  OVERHEAD_COUNT  = sizeof(OVERHEAD_CHOICES) / sizeof(OVERHEAD_CHOICES[0]);
+const float    NM_PER_MI       = 0.868976f;
 const char*    PROVIDER_NAMES[] = {"airplanes.live", "adsb.lol"};
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -80,7 +81,8 @@ const char*    PROVIDER_NAMES[] = {"airplanes.live", "adsb.lol"};
 #define STALE_MS         60000      // feed older than this is shown as stale
 #define REDRAW_MS        500        // radar frame interval (positions are extrapolated)
 #define SELECT_MS        30000      // a tapped aircraft stays selected this long
-#define ALERT_FORGET_MS  600000     // an aircraft can alert again after this long away
+#define ALERT_FORGET_MS  600000     // an aircraft can beep again after this long away
+#define CARD_EXIT_FACTOR 1.25f      // card closes once the aircraft is this far past the radius
 #define RANGE_SAVE_MS    5000       // range buttons save to NVS after this long idle
 
 // Layout: radar on the left, info panel on the right.
@@ -152,8 +154,9 @@ struct Settings {
   uint16_t poll_s;       // seconds between fetches
   bool     labels;       // callsign / altitude next to each aircraft
   bool     trails;
-  bool     alert;        // beep when an aircraft comes within alert_nm (buzzer boards)
-  uint16_t alert_nm;
+  uint16_t overhead_mi;  // "overhead" radius, statute miles
+  bool     show_card;    // full-screen card while an aircraft is overhead
+  bool     alert;        // also beep (buzzer boards)
 } settings;
 
 bool homeSet() { return settings.home_lat != 0 || settings.home_lon != 0; }
@@ -190,7 +193,8 @@ void loadSettings() {
   settings.labels       = prefs.getBool  ("labels", true);
   settings.trails       = prefs.getBool  ("trails", true);
   settings.alert        = prefs.getBool  ("alert",  false);
-  settings.alert_nm     = nearestChoice(prefs.getUShort("alertnm", 2), ALERT_CHOICES, ALERT_COUNT);
+  settings.overhead_mi  = nearestChoice(prefs.getUShort("ovmi", 1), OVERHEAD_CHOICES, OVERHEAD_COUNT);
+  settings.show_card    = prefs.getBool  ("card",   true);
   prefs.end();
 }
 
@@ -218,7 +222,8 @@ void saveSettings() {
   prefs.putBool  ("labels", settings.labels);
   prefs.putBool  ("trails", settings.trails);
   prefs.putBool  ("alert",  settings.alert);
-  prefs.putUShort("alertnm", settings.alert_nm);
+  prefs.putUShort("ovmi",   settings.overhead_mi);
+  prefs.putBool  ("card",   settings.show_card);
   prefs.end();
 }
 
@@ -229,7 +234,7 @@ const char* sourceName(uint8_t s) {
 void logSettings(const char* what) {
   Serial.printf("%s: ntp=%s tz=%s 24h=%d bright=%u%% dim=%d %s-%s at %u%% off=%d %s-%s wake=%us "
                 "home=%.5f,%.5f range=%unm src=%s prov=%s url=%s poll=%us labels=%d trails=%d "
-                "alert=%d %unm\n", what,
+                "overhead=%umi card=%d beep=%d\n", what,
                 settings.ntp_server.c_str(), settings.tz_string.c_str(), settings.format_24h,
                 settings.brightness,
                 settings.dim_enabled, hhmm(settings.dim_start).c_str(), hhmm(settings.dim_end).c_str(),
@@ -238,7 +243,7 @@ void logSettings(const char* what) {
                 settings.wake_s, settings.home_lat, settings.home_lon, settings.range_nm,
                 sourceName(settings.source), PROVIDER_NAMES[settings.provider],
                 settings.local_url.c_str(), settings.poll_s, settings.labels, settings.trails,
-                settings.alert, settings.alert_nm);
+                settings.overhead_mi, settings.show_card, settings.alert);
 }
 
 // Set from the SNTP task on each sync; loop() copies the time into the RTC
@@ -518,6 +523,7 @@ int cmpDist(const void* a, const void* b) {
 uint8_t* readBody(HTTPClient& http, size_t& len, String& err) {
   NetworkClient* in = http.getStreamPtr();
   int expected = http.getSize();                 // -1 when chunked / unknown
+  bool chunked = http.header("Transfer-Encoding").equalsIgnoreCase("chunked");
   size_t cap = expected > 0 ? expected + 1 : 64 * 1024;
   if (cap > MAX_BODY_BYTES) { err = "response too large"; return nullptr; }
   uint8_t* buf = (uint8_t*)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
@@ -540,11 +546,13 @@ uint8_t* readBody(HTTPClient& http, size_t& len, String& err) {
     }
     int n = in->read(buf + len, avail);
     if (n > 0) { len += n; last = millis(); }
+    // A kept-alive connection never closes, so stop at the last (empty) chunk.
+    if (chunked && len >= 5 && !memcmp(buf + len - 5, "0\r\n\r\n", 5)) break;
   }
   if (!buf) { err = "out of memory"; return nullptr; }
   if (expected > 0 && (int)len < expected) { err = "short read"; heap_caps_free(buf); return nullptr; }
 
-  if (http.header("Transfer-Encoding").equalsIgnoreCase("chunked")) {
+  if (chunked) {
     size_t r = 0, w = 0;
     while (r < len) {
       size_t size = strtoul((const char*)buf + r, nullptr, 16);
@@ -559,11 +567,9 @@ uint8_t* readBody(HTTPClient& http, size_t& len, String& err) {
   return buf;
 }
 
-// GETs a readsb-style JSON feed ("ac" or "aircraft" array) and keeps the
-// nearest MAX_AIRCRAFT with a recent position within range, sorted by distance.
-bool fetchFeed(const String& url, const FetchConfig& cfg, Aircraft* out, int& count, int& total,
-               String& err) {
-  count = total = 0;
+// GETs url and returns the body in PSRAM (caller frees with heap_caps_free),
+// or nullptr with err set.
+uint8_t* httpGet(const String& url, size_t& len, String& err) {
   bool https = url.startsWith("https://");
   WiFiClient plain;
   WiFiClientSecure tls;
@@ -575,16 +581,26 @@ bool fetchFeed(const String& url, const FetchConfig& cfg, Aircraft* out, int& co
   http.setConnectTimeout(4000);
   http.setTimeout(8000);
   http.setUserAgent(USER_AGENT);
-  if (!(https ? http.begin(tls, url) : http.begin(plain, url))) { err = "bad URL"; return false; }
+  http.setReuse(false);          // "Connection: close", so the server ends the body by closing
+  if (!(https ? http.begin(tls, url) : http.begin(plain, url))) { err = "bad URL"; return nullptr; }
   int code = http.GET();
   if (code != HTTP_CODE_OK) {
     err = code < 0 ? HTTPClient::errorToString(code) : "HTTP " + String(code);
     http.end();
-    return false;
+    return nullptr;
   }
-  size_t len;
   uint8_t* body = readBody(http, len, err);
   http.end();
+  return body;
+}
+
+// GETs a readsb-style JSON feed ("ac" or "aircraft" array) and keeps the
+// nearest MAX_AIRCRAFT with a recent position within range, sorted by distance.
+bool fetchFeed(const String& url, const FetchConfig& cfg, Aircraft* out, int& count, int& total,
+               String& err) {
+  count = total = 0;
+  size_t len;
+  uint8_t* body = httpGet(url, len, err);
   if (!body) return false;
   JsonDocument doc(&psramAllocator);
   DeserializationError e = deserializeJson(doc, (const char*)body, len,
@@ -639,9 +655,138 @@ bool fetchFeed(const String& url, const FetchConfig& cfg, Aircraft* out, int& co
   return true;
 }
 
+// ── Overhead card lookups (fetch task) ─────────────────────────────────────
+CardRequest cardReq = {};                 // guarded by dataMutex
+CardInfo    cardShared = {};              // guarded by dataMutex; its jpg belongs to the task
+uint32_t    cardVersion = 0;              // guarded by dataMutex
+
+#define MAX_PHOTO_BYTES (400 * 1024)
+
+JsonDocument* getJson(const String& url, String& err) {
+  size_t len;
+  uint8_t* body = httpGet(url, len, err);
+  if (!body) return nullptr;
+  JsonDocument* doc = new JsonDocument(&psramAllocator);
+  DeserializationError e = deserializeJson(*doc, (const char*)body, len);
+  heap_caps_free(body);
+  if (e) { err = String("JSON: ") + e.c_str(); delete doc; return nullptr; }
+  return doc;
+}
+
+void airportFields(JsonObject ap, char* code, size_t codeLen, char* city, size_t cityLen) {
+  const char* iata = ap["iata"] | "";
+  strlcpy(code, *iata ? iata : (ap["icao"] | ""), codeLen);
+  const char* loc = ap["location"] | "";
+  strlcpy(city, *loc ? loc : (ap["name"] | ""), cityLen);
+}
+
+// adsb.lol's route database, by callsign. Multi-stop routes ("JAC-DEN-CVG")
+// pick the leg the aircraft is on: the one it adds the least distance to.
+void lookupRoute(const CardRequest& r, CardInfo& c) {
+  String cs = r.callsign;
+  if (cs.length() < 3) return;
+  String err;
+  JsonDocument* doc = getJson("https://vrs-standing-data.adsb.lol/routes/" + cs.substring(0, 2) + "/" +
+                              cs + ".json", err);
+  if (!doc) { Serial.printf("Route %s: %s\n", r.callsign, err.c_str()); return; }
+  JsonArray aps = (*doc)["_airports"];
+  int n = aps.size(), best = -1;
+  float bestCost = 1e9;
+  for (int i = 0; i + 1 < n; i++) {
+    double la0 = aps[i]["lat"], lo0 = aps[i]["lon"], la1 = aps[i + 1]["lat"], lo1 = aps[i + 1]["lon"];
+    float cost = distanceNm(la0, lo0, r.lat, r.lon) + distanceNm(r.lat, r.lon, la1, lo1) -
+                 distanceNm(la0, lo0, la1, lo1);
+    if (cost < bestCost) { bestCost = cost; best = i; }
+  }
+  // The route database can be stale (callsigns get reused): ignore a route
+  // the aircraft is well off.
+  if (best >= 0) {
+    double la0 = aps[best]["lat"], lo0 = aps[best]["lon"], la1 = aps[best + 1]["lat"], lo1 = aps[best + 1]["lon"];
+    float leg = distanceNm(la0, lo0, la1, lo1);
+    if (bestCost > max(60.0f, leg * 0.3f)) {
+      Serial.printf("Route %s: %s ignored, %.0f nm off it\n", r.callsign, (*doc)["_airport_codes_iata"] | "?", bestCost);
+      best = -1;
+    }
+  }
+  if (best >= 0) {
+    airportFields(aps[best],     c.from_code, sizeof(c.from_code), c.from_city, sizeof(c.from_city));
+    airportFields(aps[best + 1], c.to_code,   sizeof(c.to_code),   c.to_city,   sizeof(c.to_city));
+  }
+  delete doc;
+}
+
+// hexdb.io: manufacturer, model and registered owner by ICAO address.
+void lookupAircraft(const String& hex, CardInfo& c) {
+  String err;
+  JsonDocument* doc = getJson("https://hexdb.io/api/v1/aircraft/" + hex, err);
+  if (!doc) { Serial.printf("Aircraft %s: %s\n", hex.c_str(), err.c_str()); return; }
+  String maker = (*doc)["Manufacturer"] | "", type = (*doc)["Type"] | "";
+  String model = type.startsWith(maker) ? type : maker + " " + type;
+  model.trim();
+  strlcpy(c.model, model.c_str(), sizeof(c.model));
+  strlcpy(c.owner, (*doc)["RegisteredOwners"] | "", sizeof(c.owner));
+  delete doc;
+}
+
+// planespotters.net: the first photo's 420x280 thumbnail and its photographer.
+void lookupPhoto(const String& hex, CardInfo& c) {
+  String err;
+  JsonDocument* doc = getJson("https://api.planespotters.net/pub/photos/hex/" + hex, err);
+  if (!doc) { Serial.printf("Photo %s: %s\n", hex.c_str(), err.c_str()); return; }
+  JsonObject photo = (*doc)["photos"][0];
+  String src = photo["thumbnail_large"]["src"] | "";
+  strlcpy(c.photographer, photo["photographer"] | "", sizeof(c.photographer));
+  delete doc;
+  if (!src.length()) return;
+  // planespotters serves progressive JPEGs, which LovyanGFX's decoder (TJpgDec)
+  // can't read; images.weserv.nl re-encodes them as baseline. Direct as fallback.
+  String proxied = src;
+  proxied.replace("https://", "");
+  proxied = "https://images.weserv.nl/?url=" + proxied + "&w=420&h=280&fit=cover&output=jpg&q=85";
+  size_t len;
+  uint8_t* jpg = httpGet(proxied, len, err);
+  if (!jpg) {
+    Serial.printf("Photo proxy: %s\n", err.c_str());
+    jpg = httpGet(src, len, err);
+  }
+  if (!jpg) { Serial.printf("Photo %s: %s\n", hex.c_str(), err.c_str()); return; }
+  if (len > MAX_PHOTO_BYTES) { heap_caps_free(jpg); return; }
+  c.jpg = jpg;
+  c.jpg_len = len;
+}
+
+// Runs the lookups for a new card request, if there is one.
+void serviceCardRequest() {
+  CardRequest r;
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
+  r = cardReq;
+  bool need = r.hex[0] && strcmp(r.hex, cardShared.hex) != 0;
+  xSemaphoreGive(dataMutex);
+  if (!need || WiFi.status() != WL_CONNECTED) return;
+
+  uint32_t start = millis();
+  CardInfo c = {};
+  strlcpy(c.hex, r.hex, sizeof(c.hex));
+  String hex = r.hex;
+  hex.toUpperCase();
+  lookupRoute(r, c);
+  lookupAircraft(hex, c);
+  lookupPhoto(hex, c);
+  c.done = true;
+  Serial.printf("Card %s: %s-%s, %s, %s, photo %u bytes (%lu ms)\n", r.callsign, c.from_code, c.to_code,
+                c.model, c.owner, (unsigned)c.jpg_len, (unsigned long)(millis() - start));
+
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
+  if (cardShared.jpg) heap_caps_free(cardShared.jpg);
+  cardShared = c;
+  cardVersion++;
+  xSemaphoreGive(dataMutex);
+}
+
 void fetchTask(void*) {
   Aircraft* work = (Aircraft*)heap_caps_malloc(sizeof(Aircraft) * MAX_AIRCRAFT, MALLOC_CAP_SPIRAM);
   for (;;) {
+    serviceCardRequest();
     FetchConfig cfg;
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     cfg = fetchCfg;
@@ -897,22 +1042,25 @@ void updateBeep() {
   beepNext = millis() + BEEP_MS;
 }
 
-// Aircraft that have come within alert_nm recently, so each alerts once per pass.
+// Aircraft that have come overhead recently, so each beeps once per pass.
 struct AlertSeen { char hex[7]; uint32_t lastIn; };
 AlertSeen alertSeen[32];
 
-bool inAlertZone(const Aircraft& a) {
-  return a.alt != ALT_GROUND && a.dist_nm <= settings.alert_nm;
+float overheadNm() { return settings.overhead_mi * NM_PER_MI; }
+
+// Airborne and within the overhead radius (at fetch time).
+bool inOverhead(const Aircraft& a) {
+  return a.alt != ALT_GROUND && a.dist_nm <= overheadNm();
 }
 
 // Called with each new feed. Beeps for an airborne aircraft newly within
-// alert_nm, unless the screen is scheduled dim / off.
+// the overhead radius, unless the screen is scheduled dim / off.
 void checkAlerts() {
   uint32_t now = millis();
   bool beep = false;
   for (int i = 0; i < viewCount; i++) {
     const Aircraft& a = viewAc[i];
-    if (!inAlertZone(a)) continue;
+    if (!inOverhead(a)) continue;
     AlertSeen* slot = nullptr;
     AlertSeen* oldest = &alertSeen[0];
     for (auto& s : alertSeen) {
@@ -957,7 +1105,14 @@ input[type=range]{width:100%;margin-top:8px}
 .live{color:#6cf;font-size:18px}
 .err{color:#f96!important}
 hr{border:0;border-top:1px solid #333;margin:25px 0}
-</style></head><body>
+div#map{height:320px;margin-top:10px;border-radius:6px;background:#1a1a1a}
+.leaflet-tile-pane{filter:invert(1) hue-rotate(180deg) brightness(.9) contrast(.9)}
+.search{display:flex;gap:8px;margin-top:10px}
+.search input{flex:1;margin-top:0!important}
+.search button{width:auto;margin:0;padding:10px 16px}
+</style>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script></head><body>
 <h1>Overhead</h1>
 
 <div class="status">
@@ -979,11 +1134,13 @@ hr{border:0;border-top:1px solid #333;margin:25px 0}
 <div><label>Latitude</label><input type="text" name="lat" value="%LAT%" inputmode="decimal"></div>
 <div><label>Longitude</label><input type="text" name="lon" value="%LON%" inputmode="decimal"></div>
 </div>
-<div class="hint">Decimal degrees, e.g. 39.7392 and -104.9903. In Google Maps, right-click your house and click the coordinates to copy them.</div>
+<div class="search"><input type="text" id="q" placeholder="Search an address or place"><button type="button" id="find">Find</button></div>
+<div id="map"><div class="hint" style="padding:12px">The map needs internet access in this browser; you can still type the coordinates.</div></div>
+<div class="hint">Click the map or drag the pin to your house. Blue: radar range; red: overhead radius.</div>
 
 <h2>Radar</h2>
 <label>Range</label>
-<select name="range">%RANGEOPTS%</select>
+<select name="range" id="range">%RANGEOPTS%</select>
 <label class="cb"><input type="checkbox" name="labels" %LABELS%> Callsign and altitude labels</label>
 <label class="cb"><input type="checkbox" name="trails" %TRAILS%> Trails</label>
 
@@ -1006,10 +1163,14 @@ hr{border:0;border-top:1px solid #333;margin:25px 0}
 <input type="number" name="poll" min="1" max="120" value="%POLL%">
 <div class="hint">At least 5 s whenever the online feed may be used (free, rate-limited APIs).</div>
 
-<div %ALERTSTYLE%>
-<h2>Overhead Alert</h2>
-<label class="cb"><input type="checkbox" name="alert" %ALERT%> Beep when an aircraft comes within</label>
-<select name="alertnm">%ALERTOPTS%</select>
+<h2>Overhead</h2>
+<label>An aircraft is overhead when it's within</label>
+<select name="ovmi" id="ovmi">%OVOPTS%</select>
+<div class="hint">Horizontal distance from home, at any altitude. Shown as a dashed circle on the radar and the map.</div>
+<label class="cb"><input type="checkbox" name="card" %CARD%> Show a full-screen card about it</label>
+<div class="hint">Route, aircraft, photo and live altitude / speed. Closes when it moves away, or tap it.</div>
+<div %BEEPSTYLE%>
+<label class="cb"><input type="checkbox" name="alert" %ALERT%> Beep</label>
 <div class="hint">Once per aircraft; quiet while the screen is scheduled dim or off.</div>
 <button type="button" onclick="fetch('/beep',{method:'POST'})">Test beep</button>
 </div>
@@ -1074,7 +1235,7 @@ hr{border:0;border-top:1px solid #333;margin:25px 0}
 </form>
 
 <script>
-function tick(){
+const tick=()=>{
   fetch('/status').then(r=>r.json()).then(s=>{
     document.getElementById('time').textContent=s.time;
     document.getElementById('feed').textContent=s.source?`${s.source}, ${s.count} in range (${s.total} received), ${s.age}s ago`:'no data yet';
@@ -1083,6 +1244,43 @@ function tick(){
   }).catch(()=>{});
 }
 setInterval(tick,2000); tick();
+
+// Map picker: Leaflet + OpenStreetMap tiles (no key; darkened by CSS), OSM Nominatim search.
+(()=>{
+  if(!window.L)return;
+  const la=document.querySelector('[name=lat]'),lo=document.querySelector('[name=lon]');
+  const rng=document.getElementById('range'),ov=document.getElementById('ovmi');
+  const start=[parseFloat(la.value)||%DEFLAT%,parseFloat(lo.value)||%DEFLON%];
+  const mapDiv=document.getElementById('map');mapDiv.innerHTML='';
+  const map=L.map(mapDiv).setView(start,12);
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,
+    attribution:'&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'}).addTo(map);
+  const pin=L.marker(start,{draggable:true}).addTo(map);
+  const rc=L.circle(start,{radius:rng.value*1852,color:'#6cf',weight:1,fill:false}).addTo(map);
+  const oc=L.circle(start,{radius:ov.value*1609.344,color:'#f66',weight:2,dashArray:'4 4',fillOpacity:0.08}).addTo(map);
+  const place=(p,fromInputs)=>{
+    pin.setLatLng(p);rc.setLatLng(p);oc.setLatLng(p);
+    if(!fromInputs){la.value=p.lat.toFixed(5);lo.value=p.lng.toFixed(5);}
+  }
+  map.on('click',e=>place(e.latlng));
+  pin.on('dragend',()=>place(pin.getLatLng()));
+  [la,lo].forEach(i=>i.addEventListener('change',()=>{
+    const p=L.latLng(parseFloat(la.value),parseFloat(lo.value));
+    if(!isNaN(p.lat)&&!isNaN(p.lng)){place(p,true);map.panTo(p);}
+  }));
+  rng.addEventListener('change',()=>rc.setRadius(rng.value*1852));
+  ov.addEventListener('change',()=>oc.setRadius(ov.value*1609.344));
+  const find=()=>{
+    const q=document.getElementById('q').value.trim();if(!q)return;
+    fetch('https://nominatim.openstreetmap.org/search?format=json&limit=1&q='+encodeURIComponent(q))
+      .then(r=>r.json()).then(j=>{
+        if(!j.length){alert('Not found');return;}
+        const p=L.latLng(+j[0].lat,+j[0].lon);place(p);map.setView(p,16);
+      }).catch(()=>alert('Search failed'));
+  }
+  document.getElementById('find').onclick=find;
+  document.getElementById('q').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();find();}});
+})();
 </script>
 </body></html>
 )HTML";
@@ -1096,11 +1294,11 @@ String uptimeString() {
   return String(buf);
 }
 
-String choiceOptions(const uint16_t* choices, uint8_t n, uint16_t current) {
+String choiceOptions(const uint16_t* choices, uint8_t n, uint16_t current, const char* unit) {
   String out;
   for (int i = 0; i < n; i++) {
     out += "<option value=\"" + String(choices[i]) + "\"" + (choices[i] == current ? " selected" : "") +
-           ">" + String(choices[i]) + " nm</option>";
+           ">" + String(choices[i]) + " " + unit + "</option>";
   }
   return out;
 }
@@ -1122,7 +1320,7 @@ void handleRoot() {
   html.replace("%UPTIME%", uptimeString());
   html.replace("%LAT%",    homeSet() ? String(settings.home_lat, 5) : "");
   html.replace("%LON%",    homeSet() ? String(settings.home_lon, 5) : "");
-  html.replace("%RANGEOPTS%", choiceOptions(RANGE_CHOICES, RANGE_COUNT, settings.range_nm));
+  html.replace("%RANGEOPTS%", choiceOptions(RANGE_CHOICES, RANGE_COUNT, settings.range_nm, "nm"));
   html.replace("%LABELS%", settings.labels ? "checked" : "");
   html.replace("%TRAILS%", settings.trails ? "checked" : "");
   html.replace("%SRC0%",   settings.source == SRC_AUTO   ? "selected" : "");
@@ -1133,8 +1331,11 @@ void handleRoot() {
   html.replace("%PROV1%",  settings.provider == PROV_ADSB_LOL       ? "selected" : "");
   html.replace("%POLL%",   String(settings.poll_s));
   html.replace("%ALERT%",  settings.alert ? "checked" : "");
-  html.replace("%ALERTOPTS%", choiceOptions(ALERT_CHOICES, ALERT_COUNT, settings.alert_nm));
-  html.replace("%ALERTSTYLE%", CrowPanel7::hasBuzzer() ? "" : "style=\"display:none\"");
+  html.replace("%OVOPTS%", choiceOptions(OVERHEAD_CHOICES, OVERHEAD_COUNT, settings.overhead_mi, "mi"));
+  html.replace("%CARD%",   settings.show_card ? "checked" : "");
+  html.replace("%BEEPSTYLE%", CrowPanel7::hasBuzzer() ? "" : "style=\"display:none\"");
+  html.replace("%DEFLAT%", String(DEFAULT_LAT, 4));
+  html.replace("%DEFLON%", String(DEFAULT_LON, 4));
   html.replace("%NTP%",    htmlEscape(settings.ntp_server));
   html.replace("%TZ%",     htmlEscape(settings.tz_string));
   html.replace("%FMT24%",  settings.format_24h ? "checked" : "");
@@ -1153,6 +1354,7 @@ void handleRoot() {
   server.send(200, "text/html", html);
 }
 
+bool configOpen = false;         // on-screen settings showing
 bool radarDirty = true;           // redraw now, not at the next REDRAW_MS tick
 uint32_t rangeSaveAt = 0;         // millis() to save after the range buttons; 0 = none
 
@@ -1174,10 +1376,9 @@ void handleSave() {
   if (server.hasArg("url"))  { settings.local_url = server.arg("url"); settings.local_url.trim(); }
   if (server.hasArg("poll")) settings.poll_s = constrain(server.arg("poll").toInt(), 1, 120);
   settings.poll_s = max(settings.poll_s, minPoll(settings.source));
-  if (CrowPanel7::hasBuzzer()) {
-    settings.alert = server.hasArg("alert");
-    if (server.hasArg("alertnm")) settings.alert_nm = nearestChoice(server.arg("alertnm").toInt(), ALERT_CHOICES, ALERT_COUNT);
-  }
+  if (server.hasArg("ovmi")) settings.overhead_mi = nearestChoice(server.arg("ovmi").toInt(), OVERHEAD_CHOICES, OVERHEAD_COUNT);
+  settings.show_card = server.hasArg("card");
+  if (CrowPanel7::hasBuzzer()) settings.alert = server.hasArg("alert");
   if (server.hasArg("ntp")) settings.ntp_server = server.arg("ntp");
   if (server.hasArg("tz"))  settings.tz_string  = server.arg("tz");
   settings.format_24h = server.hasArg("fmt24");
@@ -1475,8 +1676,9 @@ void drawRadarBackground() {
   spr.setTextColor(COL_ACCENT);
   spr.drawString("N", RADAR_CX, RADAR_CY - RADAR_R + 12);
 
-  if (settings.alert && CrowPanel7::hasBuzzer() && settings.alert_nm < settings.range_nm) {
-    int ar = lroundf(settings.alert_nm * s);
+  if ((settings.show_card || (settings.alert && CrowPanel7::hasBuzzer())) &&
+      overheadNm() < settings.range_nm) {
+    int ar = lroundf(overheadNm() * s);
     uint16_t col = rgb888to565(90, 30, 34);
     for (int a = 0; a < 360; a += 10) {   // dashed
       float a0 = a * DEG, a1 = (a + 5) * DEG;
@@ -1582,7 +1784,7 @@ void drawAircraft(uint32_t now) {
       float x = px[i], y = py[i];
       if (settings.trails) drawTrail(a, x, y);
       uint16_t col = altColor(a.alt);
-      if (settings.alert && CrowPanel7::hasBuzzer() && inAlertZone(a)) {
+      if (inOverhead(a)) {
         spr.drawCircle(x, y, 17, COL_ALERT);
         spr.drawCircle(x, y, 18, COL_ALERT);
       }
@@ -1797,6 +1999,220 @@ void drawFrame(const struct tm* ti) {
   presentFrame();
 }
 
+// ── Overhead card ─────────────────────────────────────────────────────────
+// Full screen while an airborne aircraft is within the overhead radius; closes
+// once it is CARD_EXIT_FACTOR past it (or missing from 3 feeds), or on a tap.
+// A dismissed aircraft doesn't reopen the card until it has left.
+#define PHOTO_W 420
+#define PHOTO_H 280
+
+char        cardHex[7] = "";      // aircraft on the card; "" = no card
+char        dismissedHex[7] = "";
+int         cardMissing = 0;      // consecutive feeds without the card's aircraft
+CardInfo    card = {};            // loop's copy; card.jpg is not used here
+uint32_t    cardSeenVersion = 0;
+LGFX_Sprite photo;
+bool        photoOk = false;
+
+bool cardShowing() { return cardHex[0] != 0; }
+
+void requestCard(const Aircraft& a) {
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
+  strlcpy(cardReq.hex, a.hex, sizeof(cardReq.hex));
+  strlcpy(cardReq.callsign, a.flight, sizeof(cardReq.callsign));
+  cardReq.lat = a.lat;
+  cardReq.lon = a.lon;
+  xSemaphoreGive(dataMutex);
+  if (fetchTaskHandle) xTaskNotifyGive(fetchTaskHandle);
+}
+
+void openCard(const Aircraft& a) {
+  strlcpy(cardHex, a.hex, sizeof(cardHex));
+  cardMissing = 0;
+  selHex[0] = 0;
+  if (strcmp(card.hex, a.hex) != 0) { memset(&card, 0, sizeof(card)); photoOk = false; }
+  requestCard(a);
+  Serial.printf("Card open: %s %.2f nm\n", aircraftName(a).c_str(), a.dist_nm);
+}
+
+void closeCard(const char* why) {
+  Serial.printf("Card closed (%s)\n", why);
+  cardHex[0] = 0;
+}
+
+// Called with each new feed.
+void updateCard() {
+  float exitNm = overheadNm() * CARD_EXIT_FACTOR;
+  if (dismissedHex[0]) {
+    int i = findAircraft(dismissedHex);
+    if (i < 0 || viewAc[i].dist_nm > exitNm) dismissedHex[0] = 0;
+  }
+  if (cardShowing()) {
+    int i = findAircraft(cardHex);
+    if (!settings.show_card)                    closeCard("turned off");
+    else if (i < 0)                             { if (++cardMissing >= 3) closeCard("gone"); }
+    else if (viewAc[i].alt == ALT_GROUND)       closeCard("landed");
+    else if (viewAc[i].dist_nm > exitNm)        closeCard("left");
+    else                                        cardMissing = 0;
+  }
+  if (!cardShowing() && settings.show_card && !configOpen) {
+    for (int i = 0; i < viewCount; i++) {   // nearest first
+      if (inOverhead(viewAc[i]) && strcmp(viewAc[i].hex, dismissedHex) != 0) { openCard(viewAc[i]); break; }
+    }
+  }
+}
+
+// Picks up finished lookups; decodes the photo once into a PSRAM sprite.
+bool pullCard() {
+  uint8_t* jpg = nullptr;
+  size_t len = 0;
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
+  bool fresh = cardVersion != cardSeenVersion;
+  if (fresh) {
+    cardSeenVersion = cardVersion;
+    card = cardShared;
+    card.jpg = nullptr;
+    if (cardShared.jpg && (jpg = (uint8_t*)heap_caps_malloc(cardShared.jpg_len, MALLOC_CAP_SPIRAM))) {
+      memcpy(jpg, cardShared.jpg, cardShared.jpg_len);
+      len = cardShared.jpg_len;
+    }
+  }
+  xSemaphoreGive(dataMutex);
+  if (!fresh) return false;
+  photoOk = false;
+  if (jpg) {
+    if (!photo.getBuffer()) {
+      photo.setPsram(true);
+      photo.setColorDepth(16);
+      photo.createSprite(PHOTO_W, PHOTO_H);
+    }
+    if (photo.getBuffer()) {
+      photo.fillSprite(COL_ROW);
+      photoOk = photo.drawJpg(jpg, len, 0, 0, PHOTO_W, PHOTO_H, 0, 0, 0.0f, 0.0f, lgfx::datum_t::middle_center);
+      if (!photoOk) Serial.printf("Photo: couldn't decode %u bytes\n", (unsigned)len);
+    }
+    heap_caps_free(jpg);
+  }
+  return true;
+}
+
+// Shortens s with "..." until it fits w px in the current font.
+String fitText(String s, int w) {
+  if (spr.textWidth(s) <= w) return s;
+  while (s.length() > 1 && spr.textWidth(s + "...") > w) s.remove(s.length() - 1);
+  return s + "...";
+}
+
+void drawCardRow(int y, const char* label, const String& value, uint16_t col = TFT_WHITE) {
+  const int x0 = 456, x1 = SCREEN_W - 20;
+  useFont(font20);
+  spr.setTextDatum(ML_DATUM);
+  spr.setTextColor(COL_DIM_TEXT);
+  spr.drawString(label, x0, y);
+  useFont(font24);
+  spr.setTextDatum(MR_DATUM);
+  spr.setTextColor(col);
+  spr.drawString(value, x1, y);
+}
+
+void drawCard(const Aircraft& a, const struct tm* ti) {
+  const uint16_t BG = rgb888to565(12, 16, 24);
+  uint32_t now = millis();
+  uint16_t altCol = altColor(a.alt);
+  bool ready = !strcmp(card.hex, a.hex) && card.done;
+  spr.fillSprite(BG);
+  spr.fillRect(0, 0, 10, SCREEN_H, altCol);
+
+  // Header: callsign, operator; distance from home on the right.
+  double lat, lon;
+  extrapolate(a, now, lat, lon);
+  float dMi = distanceNm(settings.home_lat, settings.home_lon, lat, lon) / NM_PER_MI;
+  float b = bearingDeg(settings.home_lat, settings.home_lon, lat, lon);
+  useFont(font20);
+  spr.setTextDatum(TR_DATUM);
+  spr.setTextColor(COL_ALERT);
+  spr.drawString("OVERHEAD", SCREEN_W - 20, 16);
+  useFont(font32);
+  spr.setTextColor(TFT_WHITE);
+  int distW = spr.drawString((dMi < 10 ? String(dMi, 1) : String((int)lroundf(dMi))) + " mi " + compass8(b),
+                             SCREEN_W - 20, 44);
+  useFont(font56);
+  spr.setTextDatum(TL_DATUM);
+  spr.drawString(fitText(aircraftName(a), SCREEN_W - 70 - max(distW, 120)), 28, 8);
+  useFont(font24);
+  spr.setTextColor(COL_DIM_TEXT);
+  String sub = ready && card.owner[0] ? String(card.owner) : String(ready ? "" : "Looking up...");
+  spr.drawString(fitText(sub, SCREEN_W - 48), 28, 70);
+
+  // Photo, or a big silhouette pointing along the track.
+  const int px = 20, py = 108;
+  if (photoOk && ready) {
+    photo.pushSprite(&spr, px, py);
+    useFont(font16);
+    spr.setTextDatum(TL_DATUM);
+    spr.setTextColor(COL_DIM_TEXT);
+    spr.drawString(fitText(String(card.photographer) + " / planespotters.net", PHOTO_W),
+                   px, py + PHOTO_H + 6);
+  } else {
+    spr.fillRoundRect(px, py, PHOTO_W, PHOTO_H, 10, COL_ROW);
+    drawPlane(px + PHOTO_W / 2, py + PHOTO_H / 2, a.track >= 0 ? a.track : 0, 200, altCol);
+  }
+
+  // Right column: route, model, registration / type, live values.
+  const int x0 = 456, w = SCREEN_W - 20 - x0;
+  spr.setTextDatum(TL_DATUM);
+  if (ready && card.from_code[0]) {
+    useFont(font40);
+    spr.setTextColor(TFT_WHITE);
+    spr.drawString(String(card.from_code) + " \xE2\x86\x92 " + card.to_code, x0, py - 4);
+    useFont(font20);
+    spr.setTextColor(COL_DIM_TEXT);
+    spr.drawString(fitText(String(card.from_city) + " \xE2\x86\x92 " + card.to_city, w), x0, py + 42);
+  } else {
+    useFont(font24);
+    spr.setTextColor(COL_DIM_TEXT);
+    spr.drawString(ready ? "Route unknown" : "", x0, py + 6);
+  }
+  useFont(font24);
+  spr.setTextColor(TFT_WHITE);
+  String model = ready && card.model[0] ? String(card.model) : String(a.type);
+  spr.drawString(fitText(model, w), x0, py + 78);
+  useFont(font20);
+  spr.setTextColor(COL_DIM_TEXT);
+  String ids = a.reg;
+  if (a.type[0]) ids += (ids.length() ? "  " : "") + String(a.type);
+  String hex = a.hex; hex.toUpperCase();
+  ids += (ids.length() ? "  " : "") + hex;
+  spr.drawString(fitText(ids, w), x0, py + 110);
+
+  int y = py + 160;
+  const int step = 36;
+  drawCardRow(y, "Altitude", altString(a.alt) + (a.alt > ALT_GROUND && a.alt < 18000 ? " ft" : ""), altCol);
+  y += step;
+  drawCardRow(y, "Vertical", a.rate ? (a.rate > 0 ? "+" : "") + String(a.rate) + " fpm" : "level"); y += step;
+  drawCardRow(y, "Speed", a.gs >= 0 ? String(a.gs) + " kt" : "-");                                 y += step;
+  drawCardRow(y, "Track", a.track >= 0 ? String(a.track) + "\xC2\xB0 " + compass8(a.track) : "-");  y += step;
+  if (a.squawk[0]) {
+    bool emergency = !strcmp(a.squawk, "7700") || !strcmp(a.squawk, "7600") || !strcmp(a.squawk, "7500");
+    drawCardRow(y, "Squawk", a.squawk, emergency ? COL_ALERT : TFT_WHITE);
+  }
+
+  // Footer: time and how to close.
+  useFont(font20);
+  spr.setTextColor(COL_DIM_TEXT);
+  spr.setTextDatum(BL_DATUM);
+  if (ti) {
+    char t[12];
+    if (settings.format_24h) snprintf(t, sizeof(t), "%02d:%02d", ti->tm_hour, ti->tm_min);
+    else snprintf(t, sizeof(t), "%d:%02d %s", ti->tm_hour % 12 ? ti->tm_hour % 12 : 12, ti->tm_min,
+                  ti->tm_hour < 12 ? "AM" : "PM");
+    spr.drawString(t, 28, SCREEN_H - 12);
+  }
+  spr.setTextDatum(BR_DATUM);
+  spr.drawString("Tap to close", SCREEN_W - 20, SCREEN_H - 12);
+  presentFrame();
+}
+
 void stepRange(int dir) {
   int i = 0;
   while (i < RANGE_COUNT - 1 && RANGE_CHOICES[i] < settings.range_nm) i++;
@@ -1813,6 +2229,11 @@ void handleViewTouch() {
   if (!touch.started) return;
   int x = touch.x, y = touch.y;
   radarDirty = true;
+  if (cardShowing()) {
+    strlcpy(dismissedHex, cardHex, sizeof(dismissedHex));
+    closeCard("tapped");
+    return;
+  }
   if (x < PANEL_X) {
     int best = -1, bestD = 40 * 40;
     for (int i = 0; i < hitCount; i++) {
@@ -1862,8 +2283,8 @@ void handleViewTouch() {
 #define CTRL_H    64
 #define FOOTER_Y  (SCREEN_H - 20)   // IP address line, below the last row
 
-const char* configTabs[] = {"Radar", "Dim", "Off", "Alert"};
-int configPageCount() { return CrowPanel7::hasBuzzer() ? 4 : 3; }
+const char* configTabs[] = {"Radar", "Dim", "Off", "Overhead"};
+int configPageCount() { return 4; }
 
 int configRows(int page, ConfigRow* rows) {
   switch (page) {
@@ -1885,14 +2306,15 @@ int configRows(int page, ConfigRow* rows) {
       rows[2] = {"Until",        ROW_TIME,    &settings.off_end};
       return 3;
     default:
-      rows[0] = {"Overhead beep", ROW_TOGGLE, &settings.alert};
-      rows[1] = {"Within",       ROW_CHOICE,  &settings.alert_nm, 0, 0, ALERT_CHOICES, ALERT_COUNT, "nm"};
-      rows[2] = {"Test beep",    ROW_ACTION,  nullptr};
-      return 3;
+      rows[0] = {"Within",       ROW_CHOICE,  &settings.overhead_mi, 0, 0, OVERHEAD_CHOICES, OVERHEAD_COUNT, "mi"};
+      rows[1] = {"Show card",    ROW_TOGGLE,  &settings.show_card};
+      if (!CrowPanel7::hasBuzzer()) return 2;
+      rows[2] = {"Beep",         ROW_TOGGLE,  &settings.alert};
+      rows[3] = {"Test beep",    ROW_ACTION,  nullptr};
+      return 4;
   }
 }
 
-bool     configOpen = false;
 int      configPage = 0;
 bool     configDirty = false;     // redraw needed
 uint32_t configLastTouch = 0;
@@ -1971,6 +2393,9 @@ void drawConfig(const ConfigRow* rows, int n) {
   useFont(font40);
   for (int t = 0; t < configPageCount(); t++) {
     bool active = t == configPage;
+    useFont(font40);
+    if (spr.textWidth(configTabs[t]) > TAB_W - 28) useFont(font32);
+    if (spr.textWidth(configTabs[t]) > TAB_W - 28) useFont(font24);
     drawButton(t * TAB_W + 6, 8, TAB_W - 12, HEADER_H - 16, active ? COL_ACCENT : PANEL,
                configTabs[t], active ? TFT_BLACK : TFT_WHITE);
   }
@@ -2162,14 +2587,18 @@ void loop() {
   if (pullFeed()) {
     updateTrails();
     checkAlerts();
+    updateCard();
     radarDirty = true;
   }
+  if (pullCard()) radarDirty = true;
 
   static uint32_t lastDraw = 0;
   if (radarDirty || millis() - lastDraw >= REDRAW_MS) {
     radarDirty = false;
     lastDraw = millis();
-    drawFrame(haveTime ? &ti : nullptr);
+    int c = cardShowing() ? findAircraft(cardHex) : -1;
+    if (c >= 0) drawCard(viewAc[c], haveTime ? &ti : nullptr);
+    else        drawFrame(haveTime ? &ti : nullptr);
   } else {
     delay(beepStep ? 5 : 15);
   }

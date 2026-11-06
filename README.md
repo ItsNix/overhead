@@ -30,7 +30,7 @@ aircraft type or registration, so those appear only with the online feed.
 | CrowPanel Advance 7.0" (IPS), HW V1.3 / V1.4 / V1.5 | 16 MB | `BOARD_CROWPANEL_ADVANCE_7` |
 
 The Advance also has a battery-backed RTC and a buzzer, which this project uses
-for the overhead alert.
+for the overhead beep.
 
 ## Building
 
@@ -62,8 +62,9 @@ PSRAM and panics at boot.
 
 1. On first boot the display opens a WiFi hotspot, **`Overhead-Setup`**
    (password `overhead`). Join it and pick your network.
-2. Open **http://overhead.local** (or the IP shown on screen) and set your home
-   latitude and longitude. The default is Pocatello, Idaho.
+2. Open **http://overhead.local** (or the IP shown on screen) and set your home:
+   search for an address, click the map, or drag the pin. The default is
+   Pocatello, Idaho. The map uses OpenStreetMap tiles, so no API key is needed.
 
 To forget the saved WiFi network, touch and hold the screen while the boot
 splash is showing.
@@ -75,18 +76,38 @@ splash is showing.
   the card to close it.
 - **− / +** change the range (2–250 nm).
 - **Tap the top-left and top-right corners** within 5 s to open the on-screen
-  settings: brightness, range, labels, trails, dim/off schedules, and the alert.
+  settings: brightness, range, labels, trails, dim/off schedules, and the
+  overhead radius, card and beep.
 
-Web UI settings: home location, range, labels, trails, data source (receiver
-URL, online feed, poll interval), overhead alert, time zone, 12/24 h,
-brightness, dim and off schedules.
+Web UI settings: home location (map picker), range, labels, trails, data source
+(receiver URL, online feed, poll interval), overhead radius / card / beep, time
+zone, 12/24 h, brightness, dim and off schedules.
 
-## Overhead alert (Advance only)
+## Overhead card
 
-The board beeps twice when an airborne aircraft first comes within the alert
-radius (1–10 nm), and then not again for that aircraft for 10 minutes. The
-radius is drawn on the radar as a dashed circle. The alert stays quiet while
-the screen is scheduled dim or off.
+When an airborne aircraft comes within the overhead radius of home (1 mile by
+default; 1, 2, 3 or 5 mi, at any altitude), the screen switches to a full-page
+card about it:
+
+- callsign, operator, and live distance and direction from home
+- route, e.g. MSP → DEN (from adsb.lol's route database; hidden when the
+  database's route doesn't match where the aircraft actually is)
+- manufacturer and model (hexdb.io), registration, type and ICAO address
+- a photo with photographer credit (planespotters.net, re-encoded through
+  images.weserv.nl because the board can't decode progressive JPEGs), or a
+  silhouette pointing along its track
+- live altitude, vertical rate, speed, track and squawk (emergency codes in red)
+
+The card closes once the aircraft is 25% past the radius, lands or drops out
+of the feed. You can also tap it to close it; that aircraft won't reopen it
+until it has left. The lookups take about 3–6 s, and the card shows the live
+data meanwhile.
+
+On the Advance, it can also beep twice when an aircraft comes overhead (at most
+once per aircraft every 10 minutes, and not while the screen is scheduled dim or off).
+
+The radius is the dashed circle on the radar and the red circle on the web
+page's map.
 
 ## Diagnostics
 
