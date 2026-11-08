@@ -299,6 +299,16 @@ bool wifiOnline = false;
 // True once the clock has been set, by the RTC or NTP (anything after 2024-01-01).
 bool timeKnown() { return time(nullptr) > 1704067200; }
 
+// Local time without waiting. Not getLocalTime(&ti, 0): its loop runs only while
+// millis() - start <= 0, so it fails whenever millis() ticks between its two
+// reads (~1 in 1000 calls). loop() then drew one "Waiting for the time" frame,
+// which looks like the boot splash, and briefly dropped the dim/off schedule.
+bool localTimeNow(struct tm* ti) {
+  time_t now = time(nullptr);
+  localtime_r(&now, ti);
+  return timeKnown();
+}
+
 void applyTimeSettings() {
   // ESP32 built-in SNTP — handles DST via POSIX TZ string
   configTzTime(settings.tz_string.c_str(), settings.ntp_server.c_str());
@@ -2960,7 +2970,7 @@ void loop() {
 
   if (portalOpen) {
     struct tm pt;
-    bool pk = getLocalTime(&pt, 0);
+    bool pk = localTimeNow(&pt);
     runPortal(pk ? &pt : nullptr);
     return;
   }
@@ -2977,7 +2987,7 @@ void loop() {
   }
 
   struct tm ti;
-  bool haveTime = getLocalTime(&ti, 0);
+  bool haveTime = localTimeNow(&ti);
   currentSchedule = haveTime ? scheduleAt(ti) : SCHED_NORMAL;
 
   // A tap that wakes a dark screen does only that. Corner taps count whenever

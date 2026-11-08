@@ -43,14 +43,17 @@ static const BoardConfig BOARD = {
 
 #elif defined(BOARD_CROWPANEL_ADVANCE_7)
 // Elecrow CrowPanel-Advance-7 repo, example/V1.3_and_V1.4_and_V1.5 (esp_lcd config).
-// 820 x 500 clocks per frame: 18 MHz ≈ 44 Hz.
+// 820 x 520 clocks per frame: 18 MHz ≈ 42 Hz.
 static const BoardConfig BOARD = {
   "CrowPanel Advance 7.0 (V1.3-V1.5)",
   { 21, 47, 48, 45, 38,   9, 10, 11, 12, 13, 14,   7, 17, 18, 3, 46 },
   40, 41, 42, 39,
   18 * 1000 * 1000,
   4, 8, 8,
-  4, 8, 8,
+  // Vsync back porch 28 lines, not Elecrow's 8: the driver restarts DMA in the
+  // VSYNC ISR every frame, and 8 lines (0.36 ms) was too little slack, giving
+  // occasional one-frame full-screen shifts. 28 lines ≈ 1.3 ms.
+  4, 28, 8,
   false, false, true, true,
   true,                        // as in Elecrow's example: frees cache after scan-out reads
   15, 16,
