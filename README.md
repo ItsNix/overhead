@@ -23,8 +23,8 @@ Built on the display and board code from
 - **Your own ADS-B receiver**: readsb, dump1090 or tar1090. The display reads
   its `aircraft.json` over the LAN.
 - **Online**: [adsb.lol](https://adsb.lol) (default, free, no key) or
-  airplanes.live, which now returns 403 until they approve your project by
-  email.
+  airplanes.live, which serves only its feeders (requests from your feeder's
+  IP); everyone else gets 403 unless they approve the project by email.
 
 **Auto** mode (the default) uses the receiver when one is configured and
 answering, and otherwise falls back to the online feed. Receivers don't send

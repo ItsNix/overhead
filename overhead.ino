@@ -12,7 +12,7 @@
  * Data source (web UI):
  *   - a local ADS-B receiver (readsb / dump1090 / tar1090 aircraft.json), and/or
  *   - an online aggregator: adsb.lol (default) or airplanes.live (/v2/point/lat/lon/radius);
- *     airplanes.live answers 403 unless they have approved your project
+ *     airplanes.live serves only its feeders (by IP); others get 403 unless approved by email
  *   "Auto" uses the receiver when it answers and falls back to the online feed.
  * Fetching runs in its own task on core 0, so slow HTTPS never stalls drawing.
  *
@@ -1212,7 +1212,7 @@ div#map{height:320px;margin-top:10px;border-radius:6px;background:#1a1a1a}
 <label>Online feed</label>
 <select name="prov">
 <option value="1" %PROV1%>adsb.lol</option>
-<option value="0" %PROV0%>airplanes.live (needs approval from them)</option>
+<option value="0" %PROV0%>airplanes.live (feeders only)</option>
 </select>
 <label>Update every (seconds)</label>
 <input type="number" name="poll" min="1" max="120" value="%POLL%">
