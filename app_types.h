@@ -54,6 +54,7 @@ struct FetchConfig {
   uint8_t  provider;      // Provider
   uint16_t poll_s;
   char     local_url[128];
+  char     lol_key[96];   // adsb.lol "x-api-key"; "" = none
 };
 
 // Recent positions of one aircraft, a ring buffer of the last n points.

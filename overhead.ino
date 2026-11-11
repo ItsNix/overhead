@@ -180,6 +180,7 @@ struct Settings {
   uint8_t  source;       // Source
   uint8_t  provider;     // Provider
   String   local_url;    // receiver: host, or full aircraft.json URL
+  String   lol_key;      // adsb.lol API key ("x-api-key" header); "" = anonymous (500 requests/day)
   uint16_t poll_s;       // seconds between fetches
   bool     labels;       // callsign / altitude next to each aircraft
   bool     trails;
@@ -229,6 +230,7 @@ void loadSettings() {
   settings.source       = min<uint8_t>(prefs.getUChar("src", SRC_AUTO), SRC_ONLINE);
   settings.provider     = min<uint8_t>(prefs.getUChar("prov", PROV_ADSB_LOL), PROV_ADSB_LOL);
   settings.local_url    = prefs.getString("url",    "");
+  settings.lol_key      = prefs.getString("lolkey", "");
   settings.poll_s       = max(prefs.getUShort("poll", 5), minPoll(settings.source));
   settings.labels       = prefs.getBool  ("labels", true);
   settings.trails       = prefs.getBool  ("trails", true);
@@ -262,6 +264,7 @@ void saveSettings() {
   prefs.putUChar ("src",    settings.source);
   prefs.putUChar ("prov",   settings.provider);
   prefs.putString("url",    settings.local_url);
+  prefs.putString("lolkey", settings.lol_key);
   prefs.putUShort("poll",   settings.poll_s);
   prefs.putBool  ("labels", settings.labels);
   prefs.putBool  ("trails", settings.trails);
@@ -277,7 +280,7 @@ const char* sourceName(uint8_t s) {
 
 void logSettings(const char* what) {
   Serial.printf("%s: ntp=%s tz=%s 24h=%d clock=%d secs=%d date=%d gamma=%.1f bright=%u%% dim=%d %s-%s at %u%% off=%d %s-%s wake=%us "
-                "home=%.5f,%.5f range=%unm src=%s prov=%s url=%s poll=%us labels=%d trails=%d "
+                "home=%.5f,%.5f range=%unm src=%s prov=%s url=%s key=%s poll=%us labels=%d trails=%d "
                 "overhead=%umi card=%d beep=%d\n", what,
                 settings.ntp_server.c_str(), settings.tz_string.c_str(), settings.format_24h,
                 settings.color_clock, settings.show_seconds, settings.show_date, settings.gamma,
@@ -287,7 +290,7 @@ void logSettings(const char* what) {
                 settings.off_enabled, hhmm(settings.off_start).c_str(), hhmm(settings.off_end).c_str(),
                 settings.wake_s, settings.home_lat, settings.home_lon, settings.range_nm,
                 sourceName(settings.source), PROVIDER_NAMES[settings.provider],
-                settings.local_url.c_str(), settings.poll_s, settings.labels, settings.trails,
+                settings.local_url.c_str(), settings.lol_key.length() ? "set" : "none", settings.poll_s, settings.labels, settings.trails,
                 settings.overhead_mi, settings.show_card, settings.alert);
 }
 
@@ -517,6 +520,7 @@ void publishFetchConfig(bool fetchNow) {
   fetchCfg.provider = settings.provider;
   fetchCfg.poll_s   = settings.poll_s;
   strlcpy(fetchCfg.local_url, settings.local_url.c_str(), sizeof(fetchCfg.local_url));
+  strlcpy(fetchCfg.lol_key, settings.lol_key.c_str(), sizeof(fetchCfg.lol_key));
   xSemaphoreGive(dataMutex);
   if (fetchNow && fetchTaskHandle) xTaskNotifyGive(fetchTaskHandle);
 }
@@ -623,8 +627,8 @@ uint8_t* readBody(HTTPClient& http, size_t& len, String& err) {
 }
 
 // GETs url and returns the body in PSRAM (caller frees with heap_caps_free),
-// or nullptr with err set.
-uint8_t* httpGet(const String& url, size_t& len, String& err) {
+// or nullptr with err set. apiKey, if non-empty, is sent as "x-api-key" (adsb.lol).
+uint8_t* httpGet(const String& url, const char* apiKey, size_t& len, String& err) {
   bool https = url.startsWith("https://");
   WiFiClient plain;
   WiFiClientSecure tls;
@@ -638,6 +642,7 @@ uint8_t* httpGet(const String& url, size_t& len, String& err) {
   http.setUserAgent(USER_AGENT);
   http.setReuse(false);          // "Connection: close", so the server ends the body by closing
   if (!(https ? http.begin(tls, url) : http.begin(plain, url))) { err = "bad URL"; return nullptr; }
+  if (apiKey && apiKey[0]) http.addHeader("x-api-key", apiKey);
   int code = http.GET();
   if (code != HTTP_CODE_OK) {
     err = code < 0 ? HTTPClient::errorToString(code) : "HTTP " + String(code);
@@ -651,11 +656,11 @@ uint8_t* httpGet(const String& url, size_t& len, String& err) {
 
 // GETs a readsb-style JSON feed ("ac" or "aircraft" array) and keeps the
 // nearest MAX_AIRCRAFT with a recent position within range, sorted by distance.
-bool fetchFeed(const String& url, const FetchConfig& cfg, Aircraft* out, int& count, int& total,
+bool fetchFeed(const String& url, const char* apiKey, const FetchConfig& cfg, Aircraft* out, int& count, int& total,
                String& err) {
   count = total = 0;
   size_t len;
-  uint8_t* body = httpGet(url, len, err);
+  uint8_t* body = httpGet(url, apiKey, len, err);
   if (!body) return false;
   JsonDocument doc(&psramAllocator);
   DeserializationError e = deserializeJson(doc, (const char*)body, len,
@@ -719,7 +724,7 @@ uint32_t    cardVersion = 0;              // guarded by dataMutex
 
 JsonDocument* getJson(const String& url, String& err) {
   size_t len;
-  uint8_t* body = httpGet(url, len, err);
+  uint8_t* body = httpGet(url, nullptr, len, err);
   if (!body) return nullptr;
   JsonDocument* doc = new JsonDocument(&psramAllocator);
   DeserializationError e = deserializeJson(*doc, (const char*)body, len);
@@ -799,10 +804,10 @@ void lookupPhoto(const String& hex, CardInfo& c) {
   proxied.replace("https://", "");
   proxied = "https://images.weserv.nl/?url=" + proxied + "&w=420&h=280&fit=cover&output=jpg&q=85";
   size_t len;
-  uint8_t* jpg = httpGet(proxied, len, err);
+  uint8_t* jpg = httpGet(proxied, nullptr, len, err);
   if (!jpg) {
     Serial.printf("Photo proxy: %s\n", err.c_str());
-    jpg = httpGet(src, len, err);
+    jpg = httpGet(src, nullptr, len, err);
   }
   if (!jpg) { Serial.printf("Photo %s: %s\n", hex.c_str(), err.c_str()); return; }
   if (len > MAX_PHOTO_BYTES) { heap_caps_free(jpg); return; }
@@ -854,14 +859,14 @@ void fetchTask(void*) {
       bool haveLocal = cfg.local_url[0] != 0;
       if (cfg.source != SRC_ONLINE && haveLocal) {
         src = "receiver";
-        ok = fetchFeed(localFeedUrl(cfg.local_url), cfg, work, count, total, err);
+        ok = fetchFeed(localFeedUrl(cfg.local_url), nullptr, cfg, work, count, total, err);
         if (!ok) err = "receiver: " + err;
       }
       if (cfg.source == SRC_LOCAL && !haveLocal) err = "no receiver URL set";
       if (!ok && cfg.source != SRC_LOCAL) {
         String localErr = err;
         src = PROVIDER_NAMES[cfg.provider];
-        ok = fetchFeed(onlineFeedUrl(cfg), cfg, work, count, total, err);
+        ok = fetchFeed(onlineFeedUrl(cfg), cfg.provider == PROV_ADSB_LOL ? cfg.lol_key : nullptr, cfg, work, count, total, err);
         if (ok && localErr.length()) err = localErr;   // fell back: keep the reason visible
         else if (!ok) err = src + ": " + err;
       }
@@ -1214,6 +1219,9 @@ div#map{height:320px;margin-top:10px;border-radius:6px;background:#1a1a1a}
 <option value="1" %PROV1%>adsb.lol</option>
 <option value="0" %PROV0%>airplanes.live (feeders only)</option>
 </select>
+<label>adsb.lol API key</label>
+<input type="password" name="lolkey" value="%LOLKEY%" placeholder="sk-lol-..." autocomplete="off">
+<div class="hint">Without a key adsb.lol allows 500 requests a day per IP, which a 5 s update uses up in under an hour. Feeders can get a key from adsb.lol.</div>
 <label>Update every (seconds)</label>
 <input type="number" name="poll" min="1" max="120" value="%POLL%">
 <div class="hint">At least 5 s whenever the online feed may be used (free, rate-limited APIs).</div>
@@ -1396,6 +1404,7 @@ void handleRoot() {
   html.replace("%SRC1%",   settings.source == SRC_LOCAL  ? "selected" : "");
   html.replace("%SRC2%",   settings.source == SRC_ONLINE ? "selected" : "");
   html.replace("%URL%",    htmlEscape(settings.local_url));
+  html.replace("%LOLKEY%", htmlEscape(settings.lol_key));
   html.replace("%PROV0%",  settings.provider == PROV_AIRPLANES_LIVE ? "selected" : "");
   html.replace("%PROV1%",  settings.provider == PROV_ADSB_LOL       ? "selected" : "");
   html.replace("%POLL%",   String(settings.poll_s));
@@ -1450,6 +1459,7 @@ void handleSave() {
   if (server.hasArg("src"))  settings.source   = constrain(server.arg("src").toInt(), SRC_AUTO, SRC_ONLINE);
   if (server.hasArg("prov")) settings.provider = constrain(server.arg("prov").toInt(), PROV_AIRPLANES_LIVE, PROV_ADSB_LOL);
   if (server.hasArg("url"))  { settings.local_url = server.arg("url"); settings.local_url.trim(); }
+  if (server.hasArg("lolkey")) { settings.lol_key = server.arg("lolkey"); settings.lol_key.trim(); }
   if (server.hasArg("poll")) settings.poll_s = constrain(server.arg("poll").toInt(), 1, 120);
   settings.poll_s = max(settings.poll_s, minPoll(settings.source));
   if (server.hasArg("ovmi")) settings.overhead_mi = nearestChoice(server.arg("ovmi").toInt(), OVERHEAD_CHOICES, OVERHEAD_COUNT);
