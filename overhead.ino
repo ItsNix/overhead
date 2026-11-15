@@ -72,9 +72,9 @@ const float DEFAULT_GAMMA      = 1.0f;    // IPS: start uncorrected, tune in the
 #endif
 const float MIN_GAMMA          = 1.0f;
 const float MAX_GAMMA          = 3.0f;
-// Default home: Pocatello, Idaho (change it in the web UI).
-const double DEFAULT_LAT       = 42.8713;
-const double DEFAULT_LON       = -112.4455;
+// Default home: Salt Lake City, Utah (change it in the web UI).
+const double DEFAULT_LAT       = 40.7608;
+const double DEFAULT_LON       = -111.8910;
 const char* USER_AGENT         = "overhead-esp32/1.0 (+https://github.com/ItsNix/overhead)";
 
 // Range presets (nm) for the radar, and overhead radius presets (statute miles).

@@ -7,6 +7,8 @@ altitude, with its callsign, altitude, a climb/descent arrow and a short trail.
 Positions are extrapolated between updates so the icons move smoothly. On the
 right are a clock, the nearest aircraft, the feed status and range buttons.
 
+![Radar view over Salt Lake City](docs/radar.png)
+
 When no aircraft are airborne within range, the screen switches to the
 [colorclock](https://github.com/ItsNix/colorclock) face: the background color is
 the time (red = hour, green = minute, blue = second), with the hex code, time,
@@ -14,6 +16,8 @@ date and RGB values on top. It goes back to the radar as soon as an aircraft
 comes into range, and returns to the clock after about 20 s of empty sky. Tap
 the clock to look at the radar for 30 s. A small corner tag shows "No WiFi" or
 "No aircraft data" when the sky is only empty because the feed is down.
+
+![Color clock face](docs/clock.png)
 
 Built on the display and board code from
 [colorclock](https://github.com/ItsNix/colorclock).
@@ -72,7 +76,7 @@ PSRAM and panics at boot.
    (password `overhead`). Join it and pick your network.
 2. Open **http://overhead.local** (or the IP shown on screen) and set your home:
    search for an address, click the map, or drag the pin. The default is
-   Pocatello, Idaho. The map uses OpenStreetMap tiles, so no API key is needed.
+   Salt Lake City, Utah. The map uses OpenStreetMap tiles, so no API key is needed.
 
 ### Changing the WiFi network
 
@@ -111,7 +115,11 @@ When an airborne aircraft is about to pass within the overhead radius of home
 (1 mile by default; 1, 2, 3 or 5 mi, at any altitude), the screen switches to a
 full-page card about it. The card opens up to 60 s before the aircraft's
 predicted closest approach (from its speed and track), shows "OVERHEAD IN n s",
-then "OVERHEAD", then "PASSED". It stays up at least 45 s. The card shows:
+then "OVERHEAD", then "PASSED". It stays up at least 45 s.
+
+![Overhead card for a passing helicopter](docs/card.png)
+
+The card shows:
 
 - callsign, operator, and live distance and direction from home
 - route, e.g. MSP → DEN (from adsb.lol's route database; hidden when the
