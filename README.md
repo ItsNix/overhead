@@ -17,7 +17,10 @@ comes into range, and returns to the clock after about 20 s of empty sky. Tap
 the clock to look at the radar for 30 s. A small corner tag shows "No WiFi" or
 "No aircraft data" when the sky is only empty because the feed is down.
 
-![Color clock face](docs/clock.png)
+<p>
+  <img src="docs/clock-1.png" width="49%" alt="Color clock face at 22:35:19 (#F39752)">
+  <img src="docs/clock-2.png" width="49%" alt="Color clock face at 22:35:55 (#F397ED)">
+</p>
 
 Built on the display and board code from
 [colorclock](https://github.com/ItsNix/colorclock).
